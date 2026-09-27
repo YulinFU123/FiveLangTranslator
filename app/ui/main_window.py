@@ -309,7 +309,7 @@ class MainWindow(QMainWindow):
         """模型管理：规格选择、本地状态、下载进度与校验结果。"""
         from app.core import assets
 
-        card = Card("模型管理", "首次使用需下载 GGML 模型与 whisper.cpp 二进制；未就绪时识别与采集功能不可用。")
+        card = Card("模型管理", "选择规格后点击下载：将依次获取 GGML 模型、whisper.cpp 二进制与 VAD 模型。未就绪时识别与采集功能不可用。")
         self.model_spec = QComboBox()
         for spec in assets.MODELS:
             self.model_spec.addItem(f"{spec.key}（约 {spec.size_mb} MB · {spec.note}）", spec.key)

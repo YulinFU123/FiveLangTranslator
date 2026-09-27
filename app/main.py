@@ -432,6 +432,21 @@ class Runtime:
             self.window.set_download_finished(False, "校验失败：文件已损坏并被删除，请重新下载")
             self.window.set_asr_status("模型校验失败，已回退")
         else:
+            # 补齐其余缺失资源：就绪条件要求「模型 + whisper.cpp 二进制」同时存在，
+            # VAD 模型缺失则会降级为能量 VAD，故一并尝试获取。
+            missing = await asyncio.to_thread(assets.status)
+            if not (missing.whisper_server or missing.whisper_cli):
+                self.window.set_model_status("正在下载 whisper.cpp 二进制…")
+                try:
+                    await asyncio.to_thread(assets.download_whisper_cpp, progress)
+                except Exception as exc:
+                    self.window.set_asr_status(f"whisper.cpp 二进制下载失败：{exc}")
+            if not assets.silero_vad_path():
+                self.window.set_model_status("正在下载 VAD 模型…")
+                try:
+                    await asyncio.to_thread(assets.download_silero_vad, progress)
+                except Exception as exc:
+                    self.window.set_asr_status(f"VAD 模型下载失败：{exc}")
             self.window.set_download_finished(True, f"模型 {key} 已就绪")
             self.window.set_asr_status(f"模型 {key} 校验通过，可开始识别")
         self.refresh_model_state()
