@@ -5,8 +5,10 @@ requires-python = ">=3.11"
 dependencies = ["PySide6>=6.7,<7", "qasync>=0.27,<1", "numpy>=1.26,<3", "scipy>=1.12,<2"]
 
 [project.optional-dependencies]
-audio = ["PyAudioWPatch>=0.2.12.8", "silero-vad>=6,<7", "onnxruntime>=1.18,<2"]
-dev = ["pytest>=8,<9", "pytest-qt>=4.4,<5"]
+# 注意：Silero VAD 走纯 onnxruntime 推理（app/audio/vad.py），
+# 不依赖 silero-vad 包，避免拉入 torch 使包体膨胀到 GB 级。
+audio = ["PyAudioWPatch>=0.2.12.8", "onnxruntime>=1.18,<2"]
+dev = ["pytest>=8,<9", "pytest-qt>=4.4,<5", "pyinstaller>=6,<7"]
 
 [project.scripts]
 five-lang-translator = "app.main:main"

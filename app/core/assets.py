@@ -50,6 +50,27 @@ WHISPER_CPP_ZIP_URL = (
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.5/whisper-bin-x64.zip"
 )
 
+# Silero VAD 官方 ONNX 模型（约 2MB，由 onnxruntime 推理，避免引入 torch）
+SILERO_VAD_FILENAME = "silero_vad.onnx"
+SILERO_VAD_URL = (
+    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+)
+
+
+def silero_vad_path() -> str:
+    """Locate silero_vad.onnx: user data dir first, then the bundled copy."""
+    candidate = paths.models_dir() / SILERO_VAD_FILENAME
+    if candidate.is_file():
+        return str(candidate)
+    bundled = Path(__file__).resolve().parents[1] / "audio" / "data" / SILERO_VAD_FILENAME
+    if bundled.is_file():
+        return str(bundled)
+    return ""
+
+
+def download_silero_vad(progress=None) -> str:
+    return str(download(SILERO_VAD_URL, paths.models_dir() / SILERO_VAD_FILENAME, progress))
+
 
 def model_spec(key: str) -> ModelSpec | None:
     return next((m for m in MODELS if m.key == key), None)
@@ -129,16 +150,18 @@ def _cli() -> int:
     parser = argparse.ArgumentParser(description="FiveLangTranslator 资源下载器")
     parser.add_argument("--model", choices=[m.key for m in MODELS], help="下载指定规格的 GGML 模型")
     parser.add_argument("--whisper", action="store_true", help="下载 whisper.cpp Windows 二进制")
+    parser.add_argument("--vad", action="store_true", help="下载 Silero VAD ONNX 模型（约 2MB）")
     parser.add_argument("--status", action="store_true", help="仅显示当前资源状态")
     args = parser.parse_args()
 
-    if args.status or not (args.model or args.whisper):
+    if args.status or not (args.model or args.whisper or args.vad):
         current = status()
         print(f"模型目录    : {current.models_dir}")
         print(f"二进制目录  : {current.tools_dir}")
         print(f"已装模型    : {', '.join(current.installed_models) or '无'}")
         print(f"server      : {current.whisper_server or '无'}")
         print(f"cli         : {current.whisper_cli or '无'}")
+        print(f"vad         : {silero_vad_path() or '无'}")
         print(f"就绪        : {'是' if current.ready else '否'}")
         return 0
 
@@ -154,6 +177,9 @@ def _cli() -> int:
     if args.whisper:
         print("\n下载 whisper.cpp 二进制 ...")
         print("完成:", download_whisper_cpp(progress))
+    if args.vad:
+        print("\n下载 Silero VAD 模型 ...")
+        print("完成:", download_silero_vad(progress))
     return 0
 
 
