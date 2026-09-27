@@ -9,6 +9,7 @@
 #   --full-test   执行全量回归（默认仅执行 quick 快速门禁）
 #   --push        发布成功后推送标签至远程 origin（默认仅本地发布）
 #   --force       跳过工作区干净检查，强制发布（不推荐）
+#   --bump        同步版本号到版本文件（默认不同步，避免与标签漂移）
 #   -h, --help    显示帮助
 #
 set -Eeuo pipefail
@@ -16,6 +17,7 @@ set -Eeuo pipefail
 # ============================== 配置区 ==============================
 RELEASE_BRANCH="${RELEASE_BRANCH:-master}"          # 允许发布的分支
 CHANGELOG_FILE="${CHANGELOG_FILE:-CHANGELOG.md}"    # 变更日志文件名
+VERSION_FILE="${VERSION_FILE:-pyproject.toml}"      # 版本号元数据文件（--bump 时同步）
 REGRESSION_SCRIPT="${REGRESSION_SCRIPT:-./tests/run_regression.sh}"
 REMOTE_NAME="${REMOTE_NAME:-origin}"                # 推送远程仓库名
 COMMIT_MSG_PREFIX="chore(release):"                 # 发布提交信息前缀
@@ -33,6 +35,30 @@ log_warn() { printf '%s[WARN]%s %s\n' "$C_WARN" "$C_RST" "$*"; }
 log_err()  { printf '%s[ERROR]%s %s\n' "$C_ERR" "$C_RST" "$*" >&2; }
 log_ok()   { printf '%s[ OK ]%s %s\n' "$C_OK" "$C_RST" "$*"; }
 stage()    { printf '\n%s==> %s%s\n' "$C_INFO" "$*" "$C_RST"; }
+
+# 语义化版本 -> PEP 440（pyproject.toml 使用）
+# v1.0.0        -> 1.0.0
+# v1.0.0-alpha.2 -> 1.0.0a2
+# v1.0.0-beta.1  -> 1.0.0b1
+# v1.0.0-rc.1    -> 1.0.0rc1
+pep440() {
+  local ver="${1#v}"
+  local core="${ver%%-*}"
+  local pre=""
+  if [[ "$ver" == *-* ]]; then
+    local suffix="${ver#*-}"
+    local label="${suffix%%.*}"
+    local num="${suffix#*.}"
+    [[ "$num" == "$suffix" ]] && num=""
+    case "$label" in
+      alpha|a) pre="a${num}" ;;
+      beta|b)  pre="b${num}" ;;
+      rc|c)    pre="rc${num}" ;;
+      *)       pre="" ;;
+    esac
+  fi
+  printf '%s%s' "$core" "$pre"
+}
 
 # --------------------------- 回滚栈机制 ---------------------------
 # 每个可变更步骤注册对应回滚动作；异常时按注册逆序依次执行。
@@ -79,7 +105,7 @@ fail() {
 }
 
 cleanup() {
-  rm -f "${TMP_BLOCK:-}" "${TMP_OUT:-}" "${TMP_BACKUP:-}" 2>/dev/null || true
+  rm -f "${TMP_BLOCK:-}" "${TMP_OUT:-}" "${TMP_BACKUP:-}" "${TMP_PKG_BACKUP:-}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -95,12 +121,15 @@ usage() {
   --full-test   执行全量回归测试（默认仅执行 quick 快速门禁）
   --push        发布成功后推送标签至远程 origin（默认仅本地发布）
   --force       跳过工作区干净检查，强制发布（不推荐）
+  --bump        同步版本号到 pyproject.toml（默认不同步；启用后发布提交
+                将同时包含 CHANGELOG.md 与该版本文件）
   -h, --help    显示本帮助
 
 示例:
   ./scripts/release.sh v1.0.0 --dry-run
   ./scripts/release.sh v1.0.0 --full-test
   ./scripts/release.sh v1.1.0-rc.1 --push
+  ./scripts/release.sh v1.0.2 --bump
 USAGE
 }
 
@@ -110,6 +139,7 @@ DRY_RUN=false
 FULL_TEST=false
 DO_PUSH=$DEFAULT_PUSH
 FORCE=false
+BUMP_VERSION=false
 
 while (($# > 0)); do
   case "$1" in
@@ -117,6 +147,7 @@ while (($# > 0)); do
     --full-test) FULL_TEST=true ;;
     --push)      DO_PUSH=true ;;
     --force)     FORCE=true ;;
+    --bump)      BUMP_VERSION=true ;;
     -h|--help)   usage; exit 0 ;;
     -*)          log_err "未知参数: $1"; usage; exit 2 ;;
     *)
@@ -238,6 +269,9 @@ log_info "变更日志预览："
 printf '%s\n' "$BLOCK"
 
 if [[ "$DRY_RUN" == true ]]; then
+  if [[ "$BUMP_VERSION" == true && -f "$VERSION_FILE" ]]; then
+    log_info "试运行：将同步 $VERSION_FILE 版本号为 $(pep440 "$VERSION")"
+  fi
   log_warn "试运行模式（--dry-run）：流程预览完成，未执行任何实际修改。"
   log_info "后续将执行：3/4 回归门禁 -> 4/4 版本标签提交（--dry-run 下已跳过）"
   exit 0
@@ -276,6 +310,26 @@ fi
 mv "$TMP_OUT" "$CHANGELOG_FILE"
 log_ok "变更日志已更新: $CHANGELOG_FILE"
 
+# ---- 版本号同步（--bump，默认关闭）----
+if [[ "$BUMP_VERSION" == true ]]; then
+  if [[ ! -f "$VERSION_FILE" ]]; then
+    fail "未找到版本文件: $VERSION_FILE（--bump 需要该文件存在）"
+  fi
+  new_version="$(pep440 "$VERSION")"
+  old_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$VERSION_FILE" | head -n 1)"
+  if [[ -z "$old_version" ]]; then
+    fail "在 $VERSION_FILE 中未找到 'version = \"...\"' 字段，无法同步版本号。"
+  elif [[ "$old_version" == "$new_version" ]]; then
+    log_info "版本号已是 $new_version，无需同步"
+  else
+    TMP_PKG_BACKUP="$(mktemp)"
+    cp "$VERSION_FILE" "$TMP_PKG_BACKUP"
+    rollback_push "cp '$TMP_PKG_BACKUP' '$VERSION_FILE' && rm -f '$TMP_PKG_BACKUP'; git update-index -q --refresh -- '$VERSION_FILE' >/dev/null 2>&1 || true"
+    sed -i "0,/^version = /s/^version = \".*\"/version = \"$new_version\"/" "$VERSION_FILE"
+    log_ok "版本号已同步: $VERSION_FILE $old_version -> $new_version"
+  fi
+fi
+
 # ======================= 3/4 回归测试门禁 =======================
 stage "3/4 回归测试门禁"
 
@@ -296,7 +350,11 @@ fi
 # ======================= 4/4 版本标签提交 =======================
 stage "4/4 版本标签提交"
 
-git add "$CHANGELOG_FILE"
+RELEASE_PATHS=("$CHANGELOG_FILE")
+if [[ "$BUMP_VERSION" == true && -f "$VERSION_FILE" ]]; then
+  RELEASE_PATHS+=("$VERSION_FILE")
+fi
+git add "${RELEASE_PATHS[@]}"
 git commit -m "$COMMIT_MSG_PREFIX $VERSION" >/dev/null
 log_ok "发布提交已创建: $COMMIT_MSG_PREFIX $VERSION"
 rollback_push "git reset --hard HEAD~1 >/dev/null 2>&1"

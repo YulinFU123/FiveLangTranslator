@@ -100,6 +100,27 @@ echo "E_DIRTY=$(git status --porcelain | wc -l)"
 git config --unset core.hooksPath
 
 echo
+echo "===== TEST G: --bump 版本号同步 ====="
+printf '[project]\nname = "demo"\nversion = "0.4.0a2"\n' > pyproject.toml
+git add pyproject.toml; git commit -q -m "chore: 添加版本文件"
+./scripts/release.sh v1.1.0 --bump; echo "rc_G=$?"
+echo "G_PYPROJECT_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n 1)"
+echo "G_TAGS=[$(git tag -l | tr '\n' ' ')]"
+echo "G_RELEASE_FILES=[$(git show --name-only --pretty=format: HEAD | tr '\n' ' ')]"
+
+echo
+echo "===== TEST H: --bump 后门禁失败 -> 同时回滚变更日志与版本文件 ====="
+printf '#!/usr/bin/env bash\necho "[regression] FAILED"\nexit 1\n' > tests/run_regression.sh
+chmod +x tests/run_regression.sh
+git add tests; git commit -q -m "test: 回归脚本改为失败"
+echo "H_BEFORE_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n 1)"
+./scripts/release.sh v1.2.0 --bump; echo "rc_H=$?"
+echo "H_AFTER_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n 1)"
+echo "H_TAGS=[$(git tag -l | tr '\n' ' ')]"
+echo "H_CHANGELOG_HAS_v1.2.0=$(grep -c 'v1.2.0' CHANGELOG.md)"
+echo "H_DIRTY=$(git status --porcelain | wc -l)"
+
+echo
 echo "===== TEST F: 标签回滚动作有效性 ====="
 if git tag -d v1.0.0 >/dev/null 2>&1; then echo "F_TAG_DELETED=yes"; else echo "F_TAG_DELETED=no"; fi
 echo "F_TAGS=[$(git tag -l | tr '\n' ' ')]"
