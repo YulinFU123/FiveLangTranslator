@@ -16,10 +16,16 @@ if (-not (Test-Path $python)) {
     $python = 'python'
 }
 
-Write-Host '==> 1/3 clean previous output'
+Write-Host '==> 1/4 generate icon and version info'
+& $python (Join-Path $root 'scripts\make_icon.py')
+if ($LASTEXITCODE -ne 0) { throw 'icon generation failed' }
+& $python (Join-Path $root 'scripts\make_version_info.py')
+if ($LASTEXITCODE -ne 0) { throw 'version info generation failed' }
+
+Write-Host '==> 2/4 clean previous output'
 Remove-Item -Recurse -Force (Join-Path $root 'dist'), (Join-Path $root 'build') -ErrorAction SilentlyContinue
 
-Write-Host '==> 2/3 PyInstaller build (onedir)'
+Write-Host '==> 3/4 PyInstaller build (onedir)'
 & $python -m PyInstaller FiveLangTranslator.spec --noconfirm --distpath dist --workpath build
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed, exit code $LASTEXITCODE" }
 
@@ -36,7 +42,7 @@ if ($SkipZip) {
     exit 0
 }
 
-Write-Host '==> 3/3 package zip'
+Write-Host '==> 4/4 package zip'
 $version = '0.0.0'
 $match = Select-String -Path (Join-Path $root 'pyproject.toml') -Pattern '^version\s*=\s*"([^"]+)"'
 if ($match) { $version = $match.Matches[0].Groups[1].Value }

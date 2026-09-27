@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec: onedir (zip 免安装绿色版), windowed GUI app."""
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
@@ -44,8 +46,10 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    # 首次链路验证保留控制台便于排错；发布前改为 False（纯 GUI，无黑窗）
-    console=True,
+    # 纯 GUI 发布：无控制台黑窗
+    console=False,
+    icon=str(Path(SPECPATH) / "resources" / "icon.ico"),
+    version=str(Path(SPECPATH) / "resources" / "version_info.txt"),
 )
 
 coll = COLLECT(

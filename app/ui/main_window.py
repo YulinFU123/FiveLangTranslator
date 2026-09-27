@@ -291,11 +291,14 @@ class MainWindow(QMainWindow):
         self.asr_status = QLabel("尚未检测 whisper.cpp")
         self.asr_status.setObjectName("muted")
         self.asr_metrics = QLabel("延迟  -- ms · 实时率 -- · 语言 --")
+        self.asr_vad_label = QLabel("VAD 激活概率  --")
+        self.asr_vad_label.setObjectName("muted")
         self.language_label = QLabel("语言锁定  尚未检测")
         self.transcript_label = QLabel("稳定文本  等待识别")
         self.transcript_label.setWordWrap(True)
         metrics.box.addWidget(self.asr_status)
         metrics.box.addWidget(self.asr_metrics)
+        metrics.box.addWidget(self.asr_vad_label)
         metrics.box.addWidget(self.language_label)
         metrics.box.addWidget(self.transcript_label)
         layout.addWidget(metrics)
@@ -1057,6 +1060,9 @@ class MainWindow(QMainWindow):
 
     def set_vad_probability(self, value):
         self.prob_label.setText(f"人声概率  {value * 100:.0f}%")
+        # 识别页同步显示，便于验证端点检测灵敏度与响应延迟
+        percent = float(value) * 100
+        self.asr_vad_label.setText(f"VAD 激活概率  {percent:.0f}%")
 
     def set_audio_activity(self, value):
         self.activity_label.setText(f"状态  {value}")
