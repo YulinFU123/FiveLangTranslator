@@ -1,0 +1,14 @@
+
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+logs/
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+tests/latency_reports/

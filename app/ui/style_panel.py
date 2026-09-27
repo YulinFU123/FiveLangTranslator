@@ -3,12 +3,15 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QScreen
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QHBoxLayout, QLabel,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QGroupBox, QHBoxLayout,
+    QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from app.storage.appearance import LAYOUT_DUAL_LINE, LAYOUT_SINGLE_ALTERNATE, parse_color, to_rgba_string
 from app.storage.fonts import WEIGHT_LABELS, WEIGHT_LEVELS, list_font_families
+from app.storage.presets import (
+    CUSTOM_PRESET_ID, SUBTITLE_PRESETS, SUBTITLE_PRESET_ORDER,
+)
 from app.ui.overlay.style_manager import safe_family
 
 
@@ -115,18 +118,25 @@ class StylePanel(QWidget):
     controls in sync when the Windows theme switches the colour defaults.
     """
 
-    def __init__(self, style_manager, bus, parent: QWidget | None = None) -> None:
+    def __init__(self, preset_manager, style_manager, bus, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.pm = preset_manager
         self.sm = style_manager
         self.bus = bus
         self._recent: list[str] = []
         self._active: ColorField | None = None
         self._build()
         bus.subtitleStyleChanged.connect(self.sync_from)
+        if self.pm is not None:
+            self.pm.presetApplied.connect(self.refresh_preset_highlight)
+            self.refresh_preset_highlight(self.pm.current())
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
         root.setSpacing(12)
+
+        if self.pm is not None:
+            root.addWidget(self._build_presets())
 
         self.show_source = QCheckBox("显示原文")
         self.show_source.setToolTip("是否显示识别原文 · 实时预览")
@@ -184,6 +194,61 @@ class StylePanel(QWidget):
         layout_row.addStretch()
         root.addLayout(layout_row)
         root.addStretch()
+
+    def _build_presets(self) -> QWidget:
+        box = QGroupBox("场景预设")
+        box.setToolTip("一键套用影院 / 会议 / 阅读方案；手动修改任意配置后自动转为自定义")
+        body = QVBoxLayout(box)
+        body.setSpacing(8)
+
+        self.preset_buttons: dict[str, QPushButton] = {}
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        accents = {"cinema": "#FFD700", "meeting": "#90EE90", "reading": "#B0C4DE"}
+        for preset_id in SUBTITLE_PRESET_ORDER:
+            spec = SUBTITLE_PRESETS[preset_id]
+            button = QPushButton()
+            button.setObjectName("presetCard")
+            button.setCheckable(True)
+            button.setMinimumHeight(56)
+            button.setToolTip(f"{spec.title} · {spec.subtitle}")
+            button.setText(
+                f"<b>{spec.title}</b><br>"
+                f"<span style='font-size:10px;color:#9aa7b8'>{spec.subtitle}</span>"
+            )
+            button.setProperty("accent", accents[preset_id])
+            button.clicked.connect(lambda _=None, pid=preset_id: self._apply_preset(pid))
+            self.preset_buttons[preset_id] = button
+            row.addWidget(button)
+        body.addLayout(row)
+
+        self.preset_hint = QLabel()
+        self.preset_hint.setObjectName("muted")
+        body.addWidget(self.preset_hint)
+        return box
+
+    def _apply_preset(self, preset_id: str) -> None:
+        if self.pm is not None:
+            self.pm.apply(preset_id)
+
+    def refresh_preset_highlight(self, active_id: str) -> None:
+        for preset_id, button in self.preset_buttons.items():
+            checked = preset_id == active_id
+            button.setChecked(checked)
+            accent = button.property("accent")
+            if checked:
+                button.setStyleSheet(
+                    f"QPushButton#presetCard{{border:2px solid {accent};"
+                    f"background:rgba(56,189,248,0.14);border-radius:10px}}"
+                )
+            else:
+                button.setStyleSheet(
+                    "QPushButton#presetCard{border:1px solid #33415a;border-radius:10px}"
+                )
+        if active_id == CUSTOM_PRESET_ID or active_id not in SUBTITLE_PRESETS:
+            self.preset_hint.setText("自定义方案 · 已手动调整配置")
+        else:
+            self.preset_hint.setText(f"当前预设：{SUBTITLE_PRESETS[active_id].title}")
 
     def _populate_families(self) -> None:
         common, monospace = list_font_families()

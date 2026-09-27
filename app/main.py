@@ -35,6 +35,7 @@ from app.ui.overlay.window import OverlayWindow
 from app.ui.overlay.visibility import SubtitleVisibilityManager
 from app.ui.overlay.anchor import SubtitleAnchorManager, ANCHOR_TIPS
 from app.ui.overlay.style_manager import SubtitleStyleManager
+from app.ui.overlay.preset_manager import SubtitlePresetManager
 from app.ui.overlay.topmost import WindowTopmostManager
 from app.ui.theme import build_style, system_prefers_light
 from app.player.tracker import PlayerWindowTracker
@@ -85,7 +86,13 @@ class Runtime:
         self.glossary = GlossaryRepository(self.database)
         self.history = HistoryService(self.database)
         self.overlay = OverlayWindow(self.settings, style_manager=self.style_manager, bus=self.bus)
-        self.window = MainWindow(self.settings, self.overlay, self.style_manager, self.bus)
+        self.preset_manager = SubtitlePresetManager(
+            self.bus, self.style_manager, self.anchor_manager,
+            self.topmost_manager, self.config_repository, self.overlay,
+        )
+        self.window = MainWindow(
+            self.settings, self.overlay, self.style_manager, self.bus, self.preset_manager,
+        )
         self.pipeline = SubtitlePipelineController(self.bus, self.arbiter, self.translation)
         self.demo = DemoController(self.pipeline, self.registry)
         self.audio = AudioService()

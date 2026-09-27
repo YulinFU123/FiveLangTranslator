@@ -94,12 +94,13 @@ class MainWindow(QMainWindow):
     anchor_selected = Signal(str)
     minimized_to_tray = Signal()
 
-    def __init__(self, settings, overlay, style_manager=None, bus=None) -> None:
+    def __init__(self, settings, overlay, style_manager=None, bus=None, preset_manager=None) -> None:
         super().__init__()
         self.settings = settings
         self.overlay = overlay
         self.style_manager = style_manager
         self.bus = bus
+        self.preset_manager = preset_manager
         self.translation_dirty = False
         self.setWindowTitle("FiveLang Translator")
         self.resize(1120, 760)
@@ -862,7 +863,7 @@ class MainWindow(QMainWindow):
             "字体 / 颜色 / 排列均可实时预览并自动保存；颜色默认跟随 Windows 主题，手动修改后锁定。",
         )
         if self.style_manager is not None:
-            self.style_panel = StylePanel(self.style_manager, self.bus)
+            self.style_panel = StylePanel(self.preset_manager, self.style_manager, self.bus)
             card.box.addWidget(self.style_panel)
             self.style_panel.sync_from(self.style_manager.get_style())
             self.show_source = self.style_panel.show_source

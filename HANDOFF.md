@@ -112,6 +112,26 @@ FiveLangTranslator v0.4.0-alpha.2 的接手文档。开工前先读本文件，�
 - **已知简化（非阻断）**：字重未做「按字体族筛可选档位」——Qt6 不暴露逐字体 weight 列表，
   改为展示标准 100–900 并由 Qt 原生就近降级（规范里的「仅展示支持档位」以原生降级+提示替代）
 
+### 字幕悬浮窗 场景预设（P5 收尾闭环）
+
+- **预设定义 `app/storage/presets.py`**：纯数据 `SUBTITLE_PRESETS`（cinema/meeting/reading）+ `PresetSpec`
+  （`style` 字典 + `anchor` + `topmost`），字体族用 Qt 实际可解析名（`Microsoft YaHei UI` / `Consolas`）。
+  关键 `subtitle_active_preset` 枚举 `cinema` / `meeting` / `reading` / `custom`
+- **`SubtitlePresetManager`**（`app/ui/overlay/preset_manager.py`）：**零侵入**——不碰各管理器核心代码，
+  仅经公共接口批量设置：`style_manager.update(**spec.style)` / `anchor_manager.setAnchor` /
+  `topmost_manager.set_topmost`。订阅总线 `subtitleStyleChanged` / `subtitleAnchorChanged` / `topmost_changed`，
+  当 `active!=custom` 且实时状态与当前预设 spec 不一致时自动 `mark_custom`（当前为 custom 时跳过，避免误标）；
+  应用期间用 `_applying` 标志屏蔽自身触发，避免回环。应用失败（异常）用 `_snapshot`/`_restore` 回滚
+- **持久化**：`subtitle_active_preset` 走 `ConfigRepository` 键值存储（复用 `app_config` 表，非新表）；
+  各分项配置仍走原管理器防抖落库；手动改任意配置即置 `custom` 并立即持久化该键
+- **设置面板 `StylePanel`** 顶部新增「场景预设」`QGroupBox`：三张并排卡片（影院/会议/阅读，带场景说明 +
+  彩色描边强调色），`setCheckable` + 高亮边框标识当前生效；悬停 Tooltip 说明；点击经 `preset_manager.apply`
+  → 字幕窗同步刷新样式/位置/置顶；订阅 `presetApplied` 刷新高亮与「当前预设/自定义方案」提示；
+  应用后附带 200ms `windowOpacity` 脉冲（`_pulse`，平滑过渡反馈）。`MainWindow` / `Runtime` 已注入 `preset_manager`
+- **验收对应**：①一键生效（字体/三色/锚点/置顶全量同步）②面板各控件 + 9 宫格 + 置顶开关经总线同步
+  ③重启保持（SQLite + 重读 `subtitle_active_preset`）④手动改任意配置→高亮取消并标识自定义
+  ⑤各管理器核心代码零改动（仅走公共接口）⑥切换走原事件广播，无额外重绘
+
 ### Provider 注册表与有序回退链
 
 - 新增 `app/translation/registry.py`：预设 + `TranslationProviderRegistry` + `plan_from_settings`
@@ -138,6 +158,54 @@ FiveLangTranslator v0.4.0-alpha.2 的接手文档。开工前先读本文件，�
 - 控制中心的关闭按钮改为收起到托盘（双击托盘图标恢复），托盘菜单「显示控制中心」
 - 新增设置项补了 tooltip，并标明「立即生效」
 
+### 端到端延迟实测脚本（P0 质量基建）
+
+- **位置**：`tests/e2e_latency.py`（核心逻辑 + CLI 入口）+ `tests/e2e_latency_config.json`（配置）
+  + `tests/test_e2e_latency.py`（10 个 pytest：统计/配置/像素 diff/总线集成）
+- **零侵入**：不修改任何业务代码，仅通过公共接口复用 `EventBus` / `SubtitlePipelineController` /
+  `TranslationService` / `OverlayWindow`；测试替身 `_FakeTranslationProvider` 返回与真实 Provider
+  相同的 `ProviderResult` 形状，纯测试侧，业务无改动
+- **采集方案（纯 Windows 原生）**：
+  - 计时统一 `QueryPerformanceCounter`（≤ 1ms，非 Windows 退回 `time.perf_counter`）
+  - 分段埋点靠**订阅**总线与信号：`bus.recognition`（识别完成，由脚本模拟 ASR 产出注入）、
+    `TranslationService.translated`（翻译完成）、`bus.subtitle`（渲染开始，按 `translated_text`
+    非空判定最终帧，规避「翻译中…」中间帧，且与信号连接顺序无关）
+  - 端到端终点用 **GDI 像素探针**：`PrintWindow` + `GetDIBits` 抓字幕窗客户区，稳定匹配最终帧即判定
+    像素渲染完成（用户可感知的真实延迟）；无显示/`--no-pixel` 时退回字幕信号代理模式
+- **指标**：端到端总延迟 + 分段（识别/翻译/管线装配/渲染）、均值/最值/P50/P95/P99，线性插值百分位
+- **场景覆盖**：`basic`（冷启动 + 稳态）、`style`（影院/会议/阅读预设渲染耗时差异）、
+  `state`（置顶开/关、显示/隐藏后台）、`load`（短/长文本）；`vary_text_per_iteration`（默认开）保证
+  每次为真实缓存未命中以测真实引擎耗时，关闭则复现缓存主导的稳态
+- **报告**：控制台实时进度 + 结构化 JSON（环境/配置/各场景汇总+样本/异常/瓶颈占比）+ 每样本 CSV；
+  瓶颈分段占比分析，超 `thresholds` 标记异常；超时/超 `discard_above_ms` 的硬异常值剔除出统计
+- **运行**：`python -m tests.e2e_latency [--config ...] [--scenario basic|style|state|load]
+  [--iterations N] [--no-pixel] [--output-dir ...]`；自动预热、自动丢弃异常值、可单场景/全量
+- **验收对应**：①同场景重复偏差（统计可量化）②覆盖全部指定场景与指标 ③业务代码零改动、不影响翻译流程
+  ④相同环境可复现 ⑤JSON/CSV 数据准确、百分位无误 ⑥阈值超界正确标记异常
+
+### 横向性能基准：接入真实 Provider（P0 扩展）
+
+- **零侵入接入真实后端**：复用应用自身 `TranslationProviderRegistry().build_chain(plan)`
+  （与 `Runtime` 完全相同的构建路径）生成 Ollama / OpenAI 兼容（LM Studio / vLLM /
+  DeepSeek / 豆包 Ark 等）真实 Provider 实例；`E2ELatencyTester._apply_provider_spec`
+  按配置 `providers` 列表切换实时翻译链（`set_providers` + `set_language_pair` + `initialize()`），
+  业务代码零改动
+- **配置（`e2e_latency_config.json`）**：`providers` 列表每项 `{name, provider_id, base_url, model,
+  api_key_environment?, api_key?, options?:{timeout,temperature,keep_alive}}`；`providers_example`
+  为同结构示例（加载时被忽略）。`language_pair` 默认 `["zh","cinema"]`；`concurrency` 默认 1
+- **横向对比**：配置多个 `providers` 时，脚本对每个 Provider 依次跑全部场景，报告新增
+  `provider_summary`（各 Provider 端到端 P50/P95/P99 + 翻译均值）与控制台「多 Provider 横向对比」表，
+  直接支撑「不同模型规格 / 不同 Provider 默认选型」量化决策
+- **失败优雅处理**：Provider 不可用 / 连接失败 → 服务发 `error` 信号（不发 `translated`）→
+  测量超时并标记为 `translation_error` 异常（不崩溃）；初始化失败则跳过该 Provider 并计入
+  `unavailable_providers`。`run()` 结束调用 `translation.cancel_all()` 清理在途任务，避免事件循环退出告警
+- **并发维度**：`concurrency>1`（仅代理模式，像素探针强制串行）时 `load` 场景按批次并发发起识别、
+  各自独立分段埋点（按 `segment_id` 隔离 `_pending`，天然并发安全），覆盖「不同并发场景」延迟分布
+- **CLI 增强**：`--provider NAME`（仅跑指定 Provider）、`--render-timeout MS`（真实 Provider 建议 ≥5000）、
+  `--concurrency N`。配置加载容忍 UTF-8 BOM（`utf-8-sig`）
+- **测试覆盖**：`test_real_provider_build_failure_is_graceful`（未知 provider 跳过不崩）、
+  `test_real_provider_error_flagged`（真实实例 + 注入异常 → 标记 translation_error 异常），共 12 个测试全绿
+
 ## 关键决策与原因
 
 1. **不做影院两行裁剪模块**。纯翻译 API 无状态、装不下上下文；同理，译文长度也不能靠显示层硬切。
@@ -151,9 +219,10 @@ FiveLangTranslator v0.4.0-alpha.2 的接手文档。开工前先读本文件，�
 ## 遗留问题
 
 - 密钥仍走环境变量，未接 Windows Credential Manager（P2）
-- 端到端延迟实测（P95、缓存命中率、各家 Provider 延迟对比）尚未记录
-- P5 剩余的字幕框外观：3 套样式预设（影院/会议/阅读）UI 与一键应用
-  （字体族/字重/字号/原文译文色/译文底色/双行或单行交替 均已实现并接线，见「样式配置核心层」；
-  「窗口置顶」、「Ctrl+Alt+H 全局热键」、「9 宫格锚点」、「双击边缘吸附」亦已实现）
+- 端到端延迟实测**脚本**已实现（见上方「端到端延迟实测脚本」小节）；真实各家 Provider 延迟对比
+  待接入真实 Provider（Ollama/OpenAI 兼容）后跑实测，脚本可直接复用
+- P5 主体功能已完整闭环：3 套样式预设（影院/会议/阅读）UI 与一键应用已全部实现并接线
+  （见「场景预设」小节）；字体族/字重/字号/原文译文色/译文底色/双行或单行交替、窗口置顶、
+  Ctrl+Alt+H 全局热键、9 宫格锚点、双击边缘吸附均已落地
 - 翻译页「测试连接」还没做成功/失败图标（当前是文字 + toast）
 - 无 git：交付机器上 `git` 不在 PATH，提交需自行执行

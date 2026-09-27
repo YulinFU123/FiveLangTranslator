@@ -26,6 +26,12 @@ from app.windows.window_styles import set_click_through
 # dragging an edge passes through every intermediate height.
 LINE_BUDGET_DEBOUNCE_MS = 100
 
+# Rapid subtitle updates (e.g. a "翻译中…" draft immediately followed by the
+# final translation for the same segment) are collapsed into a single repaint
+# inside this window, so the overlay never wastes a full repaint on a frame
+# that is about to be overwritten. Isolated updates still paint immediately.
+REPAINT_COALESCE_MS = 10
+
 
 class Edge(IntEnum):
     NONE = 0
@@ -80,6 +86,16 @@ class OverlayWindow(QWidget):
         self.line_budget_timer = QTimer(self)
         self.line_budget_timer.setSingleShot(True)
         self.line_budget_timer.timeout.connect(self.publish_line_budget)
+        # Repaint coalescing state: a single short-lived timer collapses bursts
+        # of subtitle updates into one paint so the final frame wins without an
+        # extra intermediate repaint.
+        self._pending_source = ""
+        self._pending_translation = ""
+        self._pending_dirty = False
+        self._paint_scheduled = False
+        self._paint_timer = QTimer(self)
+        self._paint_timer.setSingleShot(True)
+        self._paint_timer.timeout.connect(self._flush_pending)
         self._anchor_animation: QPropertyAnimation | None = None
         self._last_snap_time = 0.0
         # Single-alternate mode: a timer flips which line is shown; hovering the
@@ -374,15 +390,39 @@ class OverlayWindow(QWidget):
         if stable or draft:
             oc = to_rgba_string(*parse_color(self.appearance.subtitle_original_color))
             draft_color = dim_color(self.appearance.subtitle_original_color, 0.6)
-            self.source.setText(
+            self._pending_source = (
                 f'<span style="color:{oc};font-weight:{self.appearance.subtitle_font_weight}">{stable}</span>'
                 f'<span style="color:{draft_color}">{draft}</span>'
             )
         else:
-            self.source.setText(html.escape(value.source_text))
-        self.translation.setText(value.translated_text or "翻译中…")
+            self._pending_source = html.escape(value.source_text)
+        self._pending_translation = value.translated_text or "翻译中…"
+        self._pending_dirty = True
+        if self._paint_scheduled:
+            # A repaint is already queued for this burst: just restart the
+            # single-shot so the latest pending text wins, avoiding a second
+            # repaint for the soon-to-arrive final.
+            self._paint_timer.start(REPAINT_COALESCE_MS)
+            return
+        # Idle: paint immediately for the lowest possible latency, then open a
+        # short coalescing window so a follow-up update merges into one repaint.
+        self._apply_pending()
+        self._paint_scheduled = True
+        self._paint_timer.start(REPAINT_COALESCE_MS)
+
+    def _apply_pending(self) -> None:
+        """Commits the pending subtitle text to the widgets and shows the window."""
+        self.source.setText(self._pending_source)
+        self.translation.setText(self._pending_translation)
+        self._pending_dirty = False
         if not self._user_hidden:
             self.show()
+
+    def _flush_pending(self) -> None:
+        """Fires after the coalescing window; applies only if new text arrived."""
+        self._paint_scheduled = False
+        if self._pending_dirty:
+            self._apply_pending()
 
     def update_transcript_state(self, data) -> None:
         stable = html.escape(data.get("committed", ""))
