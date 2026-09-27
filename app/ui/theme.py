@@ -85,6 +85,8 @@ QPushButton#anchorButton{background:%(button)s;border:1px solid %(button_border)
 QPushButton#anchorButton:hover{background:%(button_hover)s}
 QPushButton#anchorButton:checked{background:%(primary)s;border-color:%(primary_border)s}
 QComboBox,QSpinBox,QLineEdit,QListWidget,QTableWidget{background:%(field)s;border:1px solid %(field_border)s;border-radius:8px;padding:7px}
+QProgressBar{background:%(field)s;border:1px solid %(field_border)s;border-radius:8px;padding:2px;min-height:14px;text-align:center;color:%(text)s}
+QProgressBar::chunk{background:%(primary)s;border-radius:6px}
 QTabWidget::pane{border:0}
 QTabBar::tab{background:%(tab)s;padding:10px 18px;margin-right:4px;border-radius:8px;color:%(tab_text)s}
 QTabBar::tab:selected{background:%(tab_selected)s;color:%(text)s;font-weight:600}

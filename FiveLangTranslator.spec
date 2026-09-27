@@ -20,10 +20,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "pytestqt", "tkinter"],
+    # scipy 未被 app/ 引用，排除可省下约 20MB 的 OpenBLAS
+    excludes=["pytest", "pytestqt", "tkinter", "scipy"],
     noarchive=False,
     optimize=0,
 )
+
+# 精简体积（目标 <=150MB）：
+#  - opengl32sw.dll：Mesa 软件 OpenGL，纯 Widgets 应用不需要（约 20MB）
+#  - PySide6/translations：Qt 自带 .qm 翻译，本项目未使用（约 6.7MB）
+a.binaries = [b for b in a.binaries if "opengl32sw" not in b[0].lower()]
+a.datas = [d for d in a.datas if "translations" not in d[0].lower()]
 
 pyz = PYZ(a.pure)
 

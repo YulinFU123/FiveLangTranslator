@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from time import monotonic
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
@@ -134,6 +135,7 @@ class Runtime:
         self.window.audio_refresh.connect(self.audio_refresh)
         self.window.asr_apply.connect(self.configure_asr)
         self.window.asr_benchmark.connect(self.asr.run_benchmark)
+        self.window.model_download.connect(self.download_model)
         self.window.translation_apply.connect(self.configure_translation)
         self.window.translation_test.connect(self.test_translation)
         self.audio.devices_changed.connect(self.audio_devices)
@@ -186,6 +188,7 @@ class Runtime:
 
     async def initialize(self) -> None:
         await self.registry.initialize_all()
+        self.refresh_model_state()
         warmed = await asyncio.to_thread(self.translation_cache.warm_up, CACHE_WARM_UP_ENTRIES)
         if warmed:
             self.window.statusBar().showMessage(f"已从 SQLite 预热 {warmed} 条译文到内存缓存")
@@ -334,6 +337,12 @@ class Runtime:
         self.window.set_audio_devices(self._devices)
 
     def audio_start(self, device_id, kind) -> None:
+        from app.core import assets
+
+        if not assets.status().ready:
+            # 兜底拦截：模型未就绪时不允许开始采集
+            self.window.set_audio_status("模型未就绪：请先在「本地识别」页下载 GGML 模型与 whisper.cpp 二进制")
+            return
         source = AudioSourceKind.SYSTEM_LOOPBACK if kind == "system_loopback" else AudioSourceKind.MICROPHONE
         self.settings.audio_kind = kind
         selected = next((device for device in self._devices if device.device_id == device_id), None)
@@ -377,6 +386,55 @@ class Runtime:
             self.settings.whisper_server_port,
             self.settings.whisper_server_fallback,
         )
+
+    def refresh_model_state(self) -> None:
+        """Report local ASR asset availability to the UI (also gates capture)."""
+        from app.core import assets
+
+        current = assets.status()
+        self.window.set_model_state({
+            "installed_models": current.installed_models,
+            "ready": current.ready,
+        })
+
+    def download_model(self, key: str) -> None:
+        asyncio.create_task(self._download_model_async(key))
+
+    async def _download_model_async(self, key: str) -> None:
+        from app.core import assets
+
+        loop = asyncio.get_running_loop()
+        state = {"last": monotonic(), "last_written": 0}
+
+        def progress(written: int, total: int) -> None:
+            # 运行在下载线程，UI 更新必须切回事件循环
+            now = monotonic()
+            elapsed = max(1e-6, now - state["last"])
+            speed = max(0.0, (written - state["last_written"]) / elapsed)
+            state["last"] = now
+            state["last_written"] = written
+            eta = (total - written) / speed if speed > 0 and total else None
+            loop.call_soon_threadsafe(
+                self.window.set_download_progress,
+                {"written": written, "total": total, "speed": speed, "eta": eta},
+            )
+
+        self.window.set_model_status("正在下载…")
+        try:
+            await asyncio.to_thread(assets.download_model, key, progress)
+        except Exception as exc:
+            self.window.set_download_finished(False, f"下载失败：{exc}")
+            self.window.set_asr_status(f"模型下载失败：{exc}")
+            return
+        self.window.set_download_finished(True, "下载完成，正在校验完整性…")
+        ok = await asyncio.to_thread(assets.verify_model, key)
+        if not ok:
+            self.window.set_download_finished(False, "校验失败：文件已损坏并被删除，请重新下载")
+            self.window.set_asr_status("模型校验失败，已回退")
+        else:
+            self.window.set_download_finished(True, f"模型 {key} 已就绪")
+            self.window.set_asr_status(f"模型 {key} 校验通过，可开始识别")
+        self.refresh_model_state()
 
     def configure_translation(self, payload=None) -> None:
         data = payload if isinstance(payload, dict) else {}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import tempfile
 import urllib.request
 import zipfile
@@ -17,6 +18,8 @@ class ModelSpec:
     url: str
     size_mb: int
     note: str
+    # 官方 SHA256（若已知则强校验；为空时退化为「下载后记录摘要，后续比对」）
+    sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,7 +48,24 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
 )
 
+# 下载源槽位：默认 HuggingFace，可切换到国内镜像（预留扩展位，供 UI/settings 选择）
+SOURCES: dict[str, str] = {
+    "huggingface": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main",
+    "mirror": "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main",
+}
+
+
+def model_url(key: str, source: str = "huggingface") -> str:
+    spec = model_spec(key)
+    if spec is None:
+        raise ValueError(f"未知模型规格: {key}")
+    base = SOURCES.get(source) or SOURCES["huggingface"]
+    return f"{base}/{spec.filename}"
+
+
 # whisper.cpp 官方预编译 Windows 二进制（含 whisper-cli.exe / whisper-server.exe）
+# 版本固定，与模型规格解耦，便于后续按版本绑定
+WHISPER_CPP_VERSION = "v1.7.5"
 WHISPER_CPP_ZIP_URL = (
     "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.5/whisper-bin-x64.zip"
 )
@@ -76,6 +96,43 @@ def model_spec(key: str) -> ModelSpec | None:
     return next((m for m in MODELS if m.key == key), None)
 
 
+def sha256_file(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def recorded_hash(path) -> str:
+    sidecar = Path(str(path) + ".sha256")
+    if sidecar.is_file():
+        return sidecar.read_text(encoding="utf-8").strip().split()[0]
+    return ""
+
+
+def record_hash(path) -> str:
+    value = sha256_file(path)
+    Path(str(path) + ".sha256").write_text(value, encoding="utf-8")
+    return value
+
+
+def verify_model(key: str) -> bool:
+    """Check a downloaded model. Corrupt files are deleted so a retry is clean."""
+    spec = model_spec(key)
+    if spec is None:
+        return False
+    path = paths.models_dir() / spec.filename
+    if not path.is_file():
+        return False
+    expected = spec.sha256 or recorded_hash(path)
+    if expected and sha256_file(path) != expected:
+        path.unlink(missing_ok=True)
+        Path(str(path) + ".sha256").unlink(missing_ok=True)
+        return False
+    return True
+
+
 def _find_exe(directory: Path, names: tuple[str, ...]) -> str:
     if not directory.is_dir():
         return ""
@@ -103,8 +160,22 @@ def status() -> AssetStatus:
     )
 
 
-def download(url: str, destination: Path, progress=None, timeout: float = 60.0) -> Path:
-    """Stream url to destination atomically (.part then rename)."""
+def download(url: str, destination: Path, progress=None, timeout: float = 60.0,
+             attempts: int = 3) -> Path:
+    """Stream url to destination atomically (.part then rename), with retries."""
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _download_once(url, destination, progress, timeout)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+    raise RuntimeError(f"下载失败（已重试 {attempts} 次）：{last_error}") from last_error
+
+
+def _download_once(url: str, destination: Path, progress=None, timeout: float = 60.0) -> Path:
+    """Single download attempt."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".part")
     try:
@@ -127,11 +198,16 @@ def download(url: str, destination: Path, progress=None, timeout: float = 60.0) 
     return destination
 
 
-def download_model(key: str, progress=None) -> str:
+def download_model(key: str, progress=None, source: str = "huggingface") -> str:
     spec = model_spec(key)
     if spec is None:
         raise ValueError(f"未知模型规格: {key}（可选：{', '.join(m.key for m in MODELS)}）")
-    return str(download(spec.url, paths.models_dir() / spec.filename, progress))
+    target = paths.models_dir() / spec.filename
+    path = download(model_url(key, source), target, progress)
+    if not spec.sha256:
+        # 无官方摘要时记录本次摘要，供后续完整性比对
+        record_hash(path)
+    return str(path)
 
 
 def download_whisper_cpp(progress=None) -> str:

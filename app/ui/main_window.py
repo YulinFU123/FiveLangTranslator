@@ -6,7 +6,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QPushButton, QSpinBox, QTabWidget, QTableWidget,
+    QMainWindow, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
     audio_refresh = Signal()
     asr_apply = Signal(object)
     asr_benchmark = Signal(str)
+    model_download = Signal(str)
     translation_apply = Signal(object)
     translation_test = Signal(object)
     history_start = Signal(object)
@@ -191,6 +192,7 @@ class MainWindow(QMainWindow):
         self.audio_device = QComboBox()
         refresh = QPushButton("刷新设备")
         refresh.clicked.connect(self.audio_refresh)
+        self.audio_refresh_button = refresh
         row.addWidget(QLabel("来源"))
         row.addWidget(self.audio_kind)
         row.addWidget(QLabel("设备"))
@@ -203,6 +205,9 @@ class MainWindow(QMainWindow):
         stop = QPushButton("停止采集")
         start.clicked.connect(lambda: self.audio_start.emit(self.audio_device.currentData(), self.audio_kind.currentData()))
         stop.clicked.connect(self.audio_stop)
+        # 保留句柄：模型未就绪时需要整体置灰
+        self.audio_start_button = start
+        self.audio_stop_button = stop
         actions.addWidget(start)
         actions.addWidget(stop)
         actions.addStretch()
@@ -281,6 +286,7 @@ class MainWindow(QMainWindow):
         card.box.addWidget(apply_button)
         benchrow=QHBoxLayout();self.benchmark_path=QLineEdit();self.benchmark_path.setPlaceholderText("选择16-bit PCM WAV进行真实性能测试");pickbench=QPushButton("选择测试音频");pickbench.clicked.connect(self._pick_benchmark);runbench=QPushButton("运行基准");runbench.clicked.connect(lambda:self.asr_benchmark.emit(self.benchmark_path.text().strip()));benchrow.addWidget(self.benchmark_path,1);benchrow.addWidget(pickbench);benchrow.addWidget(runbench);card.box.addLayout(benchrow)
         layout.addWidget(card)
+        layout.addWidget(self._model_card())
         metrics = Card("识别状态")
         self.asr_status = QLabel("尚未检测 whisper.cpp")
         self.asr_status.setObjectName("muted")
@@ -295,6 +301,83 @@ class MainWindow(QMainWindow):
         layout.addWidget(metrics)
         layout.addStretch()
         return page
+
+    def _model_card(self):
+        """模型管理：规格选择、本地状态、下载进度与校验结果。"""
+        from app.core import assets
+
+        card = Card("模型管理", "首次使用需下载 GGML 模型与 whisper.cpp 二进制；未就绪时识别与采集功能不可用。")
+        self.model_spec = QComboBox()
+        for spec in assets.MODELS:
+            self.model_spec.addItem(f"{spec.key}（约 {spec.size_mb} MB · {spec.note}）", spec.key)
+        self.model_download_button = QPushButton("下载模型")
+        self.model_download_button.setObjectName("primary")
+        self.model_download_button.clicked.connect(
+            lambda: self.model_download.emit(self.model_spec.currentData())
+        )
+        row = QHBoxLayout()
+        row.addWidget(QLabel("规格"))
+        row.addWidget(self.model_spec, 1)
+        row.addWidget(self.model_download_button)
+        card.box.addLayout(row)
+
+        self.model_status = QLabel("检测中…")
+        self.model_status.setObjectName("muted")
+        self.model_progress = QProgressBar()
+        self.model_progress.setRange(0, 100)
+        self.model_progress.setValue(0)
+        self.model_progress.setVisible(False)
+        self.model_progress_label = QLabel("")
+        self.model_progress_label.setObjectName("muted")
+        self.model_progress_label.setWordWrap(True)
+        card.box.addWidget(self.model_status)
+        card.box.addWidget(self.model_progress)
+        card.box.addWidget(self.model_progress_label)
+        return card
+
+    def set_model_state(self, data):
+        """data: {'installed_models': tuple[str, ...], 'ready': bool}"""
+        installed = tuple(data.get("installed_models") or ())
+        if installed:
+            self.model_status.setText(f"已下载：{'、'.join(installed)}")
+        else:
+            self.model_status.setText("未下载模型：请选择规格后点击「下载模型」")
+        self.set_capture_enabled(bool(data.get("ready")))
+        if not data.get("ready"):
+            self.model_progress_label.setText("模型未就绪，音频采集与识别功能已禁用")
+
+    def set_model_status(self, text: str) -> None:
+        self.model_status.setText(text)
+
+    def set_capture_enabled(self, enabled: bool) -> None:
+        """Gate audio capture controls until the ASR assets are ready."""
+        for widget in (
+            getattr(self, "audio_start_button", None),
+            getattr(self, "audio_refresh_button", None),
+            getattr(self, "audio_kind", None),
+            getattr(self, "audio_device", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(bool(enabled))
+
+    def set_download_progress(self, data):
+        written = int(data.get("written") or 0)
+        total = int(data.get("total") or 0)
+        speed = float(data.get("speed") or 0.0)
+        eta = data.get("eta")
+        self.model_progress.setVisible(True)
+        if total:
+            self.model_progress.setValue(min(100, int(written * 100 / total)))
+        text = f"{written / 1e6:.1f}"
+        text += f" / {total / 1e6:.1f} MB" if total else " MB"
+        text += f" · {speed / 1e6:.1f} MB/s"
+        if eta is not None:
+            text += f" · 剩余 {int(eta)} 秒"
+        self.model_progress_label.setText(text)
+
+    def set_download_finished(self, ok: bool, message: str = "") -> None:
+        self.model_progress.setVisible(ok)
+        self.model_progress_label.setText(message)
 
     def _translation_page(self):
         page = QWidget()
