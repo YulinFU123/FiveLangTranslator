@@ -4,6 +4,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from app.core import paths
+
 
 @dataclass(slots=True)
 class Profile:
@@ -66,7 +68,7 @@ class Settings:
 
 class Store:
     def __init__(self) -> None:
-        self.path = Path.home() / ".five_lang_translator" / "settings.json"
+        self.path = paths.data_root() / "settings.json"
 
     def load(self) -> Settings:
         try:

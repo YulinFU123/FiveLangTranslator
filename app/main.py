@@ -15,6 +15,7 @@ from app.asr.service import ASRService
 from app.audio.models import AudioSourceKind
 from app.audio.service import AudioService
 from app.controllers import DemoController, SubtitlePipelineController
+from app.core import paths
 from app.core.arbiter import ResultArbiter
 from app.core.events import EventBus
 from app.export.exporters import suggest_filename, write_export
@@ -61,7 +62,13 @@ class ThemeWatcher(QObject):
 class Runtime:
     def __init__(self, app: QApplication) -> None:
         self.app = app
-        self.project_root = Path(__file__).resolve().parents[1]
+        # app_root = read-only bundled resources, data_root = writable user data
+        # (models / whisper binaries / config / database). resource_root prefers
+        # downloaded assets and falls back to the bundle, which keeps discovery
+        # working both from source and from a PyInstaller build.
+        self.app_root = paths.app_root()
+        self.data_root = paths.data_root()
+        self.project_root = paths.resource_root()
         self.store = Store()
         self.settings = self.store.load()
         self.bus = EventBus()
@@ -230,6 +237,24 @@ class Runtime:
         self.window.show()
         self.overlay.show()
         self.window.sync()
+
+    def show_startup_hint(self) -> None:
+        """First-run guidance; replaces the old automatic demo playback."""
+        marker = self.data_root / ".initialized"
+        if not marker.exists():
+            try:
+                marker.write_text("1", encoding="utf-8")
+            except OSError:
+                pass
+            self.window.statusBar().showMessage(
+                "首次运行：请在「识别」页配置 whisper 后端，模型将按需下载到 "
+                f"{self.data_root / 'models'}"
+            )
+            return
+        if not self.asr.enabled:
+            self.window.statusBar().showMessage(
+                "whisper 后端未就绪：可在「识别」页指定可执行文件，或通过下载器获取模型"
+            )
 
     def _make_shortcuts(self) -> None:
         for sequence, callback in (
@@ -680,7 +705,7 @@ class Runtime:
 async def boot(runtime: Runtime) -> None:
     await runtime.initialize()
     runtime.show()
-    QTimer.singleShot(500, runtime.demo.start)
+    QTimer.singleShot(500, runtime.show_startup_hint)
 
 
 def main() -> int:

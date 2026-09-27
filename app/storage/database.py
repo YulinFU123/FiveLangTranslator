@@ -5,11 +5,13 @@ import threading
 from pathlib import Path
 from time import time
 
+from app.core import paths
+
 SCHEMA_VERSION = "1"
 
 
 def default_database_path() -> Path:
-    return Path.home() / ".five_lang_translator" / "history.db"
+    return paths.data_root() / "history.db"
 
 
 def now_ms() -> int:
