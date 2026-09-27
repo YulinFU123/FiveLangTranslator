@@ -249,9 +249,9 @@ printf '%s\n' "$BLOCK" > "$TMP_BLOCK"
 if [[ -f "$CHANGELOG_FILE" ]]; then
   TMP_BACKUP="$(mktemp)"
   cp "$CHANGELOG_FILE" "$TMP_BACKUP"
-  rollback_push "cp '$TMP_BACKUP' '$CHANGELOG_FILE' && rm -f '$TMP_BACKUP'"
+  rollback_push "cp '$TMP_BACKUP' '$CHANGELOG_FILE' && rm -f '$TMP_BACKUP'; git update-index -q --refresh -- '$CHANGELOG_FILE' >/dev/null 2>&1 || true"
 else
-  rollback_push "rm -f '$CHANGELOG_FILE'"
+  rollback_push "rm -f '$CHANGELOG_FILE'; git update-index -q --refresh -- '$CHANGELOG_FILE' >/dev/null 2>&1 || true"
 fi
 
 TMP_OUT="$(mktemp)"
