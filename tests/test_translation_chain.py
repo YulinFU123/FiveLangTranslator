@@ -95,7 +95,8 @@ def test_every_provider_failing_reports_the_whole_chain():
     assert not translations
     assert len(errors) == 1
     assert "deepseek" in errors[0]
-    assert "连接失败" in errors[0]
+    assert "密钥认证失败" in errors[0]
+    assert "本地服务未启动或无法连接" in errors[0]
 
 
 def test_cache_hit_skips_the_whole_chain():

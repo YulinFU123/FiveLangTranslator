@@ -190,7 +190,7 @@ class Runtime:
         self.history.recording_changed.connect(self.window.set_recording_state)
         self.history.session_closed.connect(lambda _session: self.refresh_history())
         self.player_tracker.changed.connect(self.overlay.set_player_state)
-        self.global_hotkeys.failed.connect(lambda message: self.window.statusBar().showMessage(message))
+        self.global_hotkeys.failed.connect(lambda message: self.window.show_toast(message, ok=False))
         self.bus.topmost_changed.connect(self.overlay.set_topmost)
         self.bus.topmost_changed.connect(self.window.set_topmost_state)
         self.window.topmost_toggled.connect(self.set_topmost)
@@ -307,12 +307,10 @@ class Runtime:
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
         )
         if not visibility_registered:
-            self.window.show_toast(
-                "全局热键 Ctrl+Alt+H 注册失败，字幕显隐热键暂不可用", ok=False,
-            )
+            # The toast + Win32 error log are emitted through the `failed`
+            # signal handler above, so just disable the now-unavailable action.
             self.tray_visibility_action.setEnabled(False)
             self.tray_visibility_action.setToolTip("")
-            logger.error("Ctrl+Alt+H 全局热键注册失败（可能已被其他程序占用或权限不足）")
 
     def _make_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.app.style().standardIcon(QStyle.SP_ComputerIcon), self.app)

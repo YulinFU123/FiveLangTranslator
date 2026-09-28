@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import ctypes
+import logging
+import traceback
 from ctypes import wintypes
 import sys
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
+
+logger = logging.getLogger(__name__)
+
+
+def _win_register_hotkey(hotkey_id: int, modifiers: int, vk: int) -> int:
+    """Thin wrapper over the Win32 RegisterHotKey, isolated for testability."""
+    return int(ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, vk))
 
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
@@ -49,7 +58,7 @@ class GlobalHotkeyManager(QObject):
         self.callbacks[hotkey_id] = callback
         if sys.platform != "win32":
             return False
-        ok = bool(ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, VK[key]))
+        ok = bool(_win_register_hotkey(hotkey_id, modifiers, VK[key]))
         if ok:
             self.registered.add(hotkey_id)
         else:
@@ -60,7 +69,12 @@ class GlobalHotkeyManager(QObject):
                 parts.append("Alt")
             if modifiers & MOD_SHIFT:
                 parts.append("Shift")
-            self.failed.emit("全局快捷键注册失败：" + "+".join(parts + [key]))
+            label = "+".join(parts + [key])
+            logger.error(
+                "全局快捷键注册失败：%s（Win32 error=%s）\n%s",
+                label, ctypes.GetLastError(), "".join(traceback.format_stack()),
+            )
+            self.failed.emit("全局快捷键注册失败：" + label)
         return ok
 
     def unregister_all(self) -> None:

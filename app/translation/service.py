@@ -10,6 +10,7 @@ from app.translation.cache import TranslationCache
 from app.translation.context import TranslationContext
 from app.translation.models import TranslationJob
 from app.translation.prompt import DEFAULT_MAX_LINES, clamp_line_budget
+from app.translation.errors import TranslationProviderError
 from app.translation.stats import LatencyTracker
 
 
@@ -188,7 +189,7 @@ class TranslationService(QObject):
                         except asyncio.CancelledError:
                             raise
                         except Exception as error:
-                            failures.append(f"{self._title(provider)}：{error}")
+                            failures.append(TranslationProviderError(self._title(provider), str(error)))
                             continue
                         translated_text = provider_result.text
                         provider_id = provider_result.provider
@@ -206,7 +207,11 @@ class TranslationService(QObject):
                     else:
                         if future is not None:
                             future.set_exception(RuntimeError("翻译失败"))
-                        self.error.emit("翻译失败 · " + " → ".join(failures))
+                            # A lone request (no concurrent caller) never awaits
+                            # this dedup future, which would otherwise log a noisy
+                            # "Future exception was never retrieved" warning.
+                            future.add_done_callback(lambda f: f.exception())
+                        self.error.emit("翻译失败 · " + " → ".join(str(f) for f in failures))
                         return
                 finally:
                     if future is not None:
