@@ -374,7 +374,14 @@ class OverlayWindow(QWidget):
         bg_rgba = to_rgba_string(*bg)
         src_rgba = to_rgba_string(*oc)
         tr_rgba = to_rgba_string(*tc)
-        border = "2px solid rgba(96,165,250,220)" if not self.locked else "1px solid rgba(255,255,255,25)"
+        # Drop the visible border entirely when the panel background is fully
+        # transparent, so the overlay reads as floating text with no box.
+        if bg[3] == 0:
+            border = "none"
+        elif self.locked:
+            border = "1px solid rgba(255,255,255,25)"
+        else:
+            border = "2px solid rgba(96,165,250,220)"
         self.setStyleSheet(
             f"QFrame#panel{{background:{bg_rgba};border:{border};border-radius:16px}}"
             "QLabel{background:transparent}"

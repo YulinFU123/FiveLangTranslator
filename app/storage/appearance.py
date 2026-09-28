@@ -33,7 +33,7 @@ class OverlayAppearance:
     subtitle_font_size: int = 16
     subtitle_original_color: str = "#cbd5e1"
     subtitle_translation_color: str = "#ffffff"
-    subtitle_bg_color: str = "rgba(8,12,20,0.76)"
+    subtitle_bg_color: str = "rgba(8,12,20,0)"
     subtitle_layout_mode: str = LAYOUT_DUAL_LINE
     # True once the user edits a colour; then the Windows theme no longer overrides.
     subtitle_colors_customized: bool = False
@@ -131,7 +131,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "subtitle_font_size": 16,
         "subtitle_original_color": "#cbd5e1",
         "subtitle_translation_color": "#ffffff",
-        "subtitle_bg_color": "rgba(8,12,20,0.76)",
+        "subtitle_bg_color": "rgba(8,12,20,0)",
         "subtitle_layout_mode": LAYOUT_DUAL_LINE,
     },
     MEETING_PRESET: {
@@ -140,7 +140,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "subtitle_font_size": 18,
         "subtitle_original_color": "#dbeafe",
         "subtitle_translation_color": "#f8fafc",
-        "subtitle_bg_color": "rgba(15,23,42,0.88)",
+        "subtitle_bg_color": "rgba(15,23,42,0)",
         "subtitle_layout_mode": LAYOUT_DUAL_LINE,
     },
     READING_PRESET: {
@@ -149,7 +149,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "subtitle_font_size": 20,
         "subtitle_original_color": "#a5b4fc",
         "subtitle_translation_color": "#e2e8f0",
-        "subtitle_bg_color": "rgba(8,12,20,0.94)",
+        "subtitle_bg_color": "rgba(8,12,20,0)",
         "subtitle_layout_mode": LAYOUT_SINGLE_ALTERNATE,
     },
 }

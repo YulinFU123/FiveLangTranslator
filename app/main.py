@@ -232,7 +232,11 @@ class Runtime:
         self.window.set_topmost_state(self.topmost_manager.isTopmost)
         self.tray_topmost_action.setChecked(self.topmost_manager.isTopmost)
         self.visibility_manager.load()
-        self.overlay.set_visible(self.visibility_manager.isVisible())
+        # Keep the overlay hidden at startup; it reveals itself on the first
+        # subtitle (or when the user toggles visibility) instead of popping open
+        # automatically.
+        if not self.visibility_manager.isVisible():
+            self.overlay.set_visible(False)
         self.window.set_visibility_state(self.visibility_manager.isVisible())
         self.anchor_manager.load()
         self.window.set_anchor_state(self.anchor_manager.getAnchor())
@@ -255,7 +259,6 @@ class Runtime:
 
     def show(self) -> None:
         self.window.show()
-        self.overlay.show()
         self.window.sync()
 
     def show_startup_hint(self) -> None:
@@ -376,8 +379,9 @@ class Runtime:
         if self.asr.enabled:
             self.asr.submit(segment)
         elif segment.is_final:
-            self.window.set_asr_status("whisper.cpp 未配置，使用模拟识别演示")
-            self.demo.start()
+            # Do not auto-start the demo: it would pop a subtitle box without the
+            # user's intent. Trigger it from the dashboard button / hotkey instead.
+            self.window.set_asr_status("whisper.cpp 未配置，点击「播放模拟实时字幕」体验演示")
 
     def configure_asr(self, payload) -> None:
         self.settings.whisper_executable = payload.get("executable", "")
