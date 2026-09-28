@@ -13,6 +13,7 @@
 
 ### 其他 (chore)
 - perf(vad): Silero VAD 改用纯 onnxruntime 推理，移除 torch 依赖
+- 构建产物: dist/FiveLangTranslator-1.0.4-win64.zip（51.7 MB，PyInstaller onedir 绿色版，已嵌入图标与版本信息）
 
 
 ## [v1.0.3] - 2026-09-27
