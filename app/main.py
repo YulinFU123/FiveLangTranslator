@@ -7,6 +7,22 @@ import sys
 from pathlib import Path
 from time import monotonic
 
+# ---- 早期日志装配：必须在任何可能失败的 import（PySide6 等）之前 ----
+# 否则启动期崩溃在 console=False 的冻结版下会被静默吞掉，毫无日志。
+from app.core import paths
+
+try:
+    from app.core.logging_setup import setup_logging
+
+    setup_logging()
+except Exception as _boot_err:  # noqa: BLE001
+    try:
+        Path(sys.executable).resolve().parent.joinpath("boot_error.log").write_text(
+            f"logging bootstrap failed: {_boot_err!r}", encoding="utf-8"
+        )
+    except Exception:
+        pass
+
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QStyle, QSystemTrayIcon
