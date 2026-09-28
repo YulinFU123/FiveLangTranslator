@@ -136,6 +136,7 @@ class Runtime:
         self.window.asr_apply.connect(self.configure_asr)
         self.window.asr_benchmark.connect(self.asr.run_benchmark)
         self.window.model_download.connect(self.download_model)
+        self.window.model_verify.connect(self.verify_assets)
         self.window.translation_apply.connect(self.configure_translation)
         self.window.translation_test.connect(self.test_translation)
         self.audio.devices_changed.connect(self.audio_devices)
@@ -396,11 +397,42 @@ class Runtime:
             "installed_models": current.installed_models,
             "ready": current.ready,
         })
+        self.window.set_assets_detail({
+            "model": ", ".join(current.installed_models) or "未下载",
+            "whisper": bool(current.whisper_server or current.whisper_cli),
+            "vad": bool(assets.silero_vad_path()),
+            "ready": current.ready,
+        })
 
-    def download_model(self, key: str) -> None:
-        asyncio.create_task(self._download_model_async(key))
+    def verify_assets(self) -> None:
+        """Re-check integrity of local assets; corrupt models are removed and reported."""
+        from app.core import assets
 
-    async def _download_model_async(self, key: str) -> None:
+        current = assets.status()
+        corrupted = [key for key in current.installed_models if not assets.verify_model(key)]
+        vad_ok = bool(assets.silero_vad_path())
+        whisper_ok = bool(current.whisper_server or current.whisper_cli)
+        if corrupted:
+            self.window.set_download_finished(
+                False, f"校验失败：{', '.join(corrupted)} 已损坏并删除，请重新下载"
+            )
+            self.window.show_toast(f"校验未通过 · {', '.join(corrupted)} 已删除", ok=False)
+        else:
+            self.window.set_download_finished(True, "完整性校验通过")
+            self.window.show_toast(
+                f"校验通过 · 模型 {len(current.installed_models)} · "
+                f"whisper.cpp {'就绪' if whisper_ok else '缺失'} · "
+                f"VAD {'就绪' if vad_ok else '缺失'}",
+                ok=True,
+            )
+        self.refresh_model_state()
+
+    def download_model(self, key: str, source: str = "huggingface") -> None:
+        self.settings.download_source = source
+        self.save()
+        asyncio.create_task(self._download_model_async(key, source))
+
+    async def _download_model_async(self, key: str, source: str = "huggingface") -> None:
         from app.core import assets
 
         loop = asyncio.get_running_loop()
@@ -421,7 +453,7 @@ class Runtime:
 
         self.window.set_model_status("正在下载…")
         try:
-            await asyncio.to_thread(assets.download_model, key, progress)
+            await asyncio.to_thread(assets.download_model, key, progress, source)
         except Exception as exc:
             self.window.set_download_finished(False, f"下载失败：{exc}")
             self.window.set_asr_status(f"模型下载失败：{exc}")
@@ -449,6 +481,22 @@ class Runtime:
                     self.window.set_asr_status(f"VAD 模型下载失败：{exc}")
             self.window.set_download_finished(True, f"模型 {key} 已就绪")
             self.window.set_asr_status(f"模型 {key} 校验通过，可开始识别")
+            # 下载完成后自动启用识别后端：若用户尚未手动指定路径，则使用自动发现。
+            if not self.asr.enabled:
+                self.window.set_model_status("正在启用识别后端…")
+                self.configure_asr({
+                    "executable": self.settings.whisper_executable,
+                    "model": self.settings.whisper_model,
+                    "language": self.settings.asr_language,
+                    "use_gpu": self.settings.asr_use_gpu,
+                    "cpu_fallback": self.settings.asr_cpu_fallback,
+                    "backend_mode": self.settings.asr_backend,
+                    "server_executable": self.settings.whisper_server_executable,
+                    "server_port": self.settings.whisper_server_port,
+                    "server_fallback": self.settings.whisper_server_fallback,
+                })
+            model_path = str(paths.models_dir() / assets.model_spec(key).filename)
+            self.window.set_asr_model_path(model_path)
         self.refresh_model_state()
 
     def configure_translation(self, payload=None) -> None:

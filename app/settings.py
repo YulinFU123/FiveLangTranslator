@@ -32,6 +32,7 @@ class Settings:
     whisper_server_fallback: bool = True
     whisper_executable: str = ""
     whisper_model: str = ""
+    download_source: str = "huggingface"
     asr_language: str = "auto"
     asr_use_gpu: bool = True
     asr_cpu_fallback: bool = True

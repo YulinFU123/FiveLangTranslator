@@ -76,7 +76,8 @@ class MainWindow(QMainWindow):
     audio_refresh = Signal()
     asr_apply = Signal(object)
     asr_benchmark = Signal(str)
-    model_download = Signal(str)
+    model_download = Signal(str, str)
+    model_verify = Signal()
     translation_apply = Signal(object)
     translation_test = Signal(object)
     history_start = Signal(object)
@@ -306,26 +307,47 @@ class MainWindow(QMainWindow):
         return page
 
     def _model_card(self):
-        """模型管理：规格选择、本地状态、下载进度与校验结果。"""
+        """模型管理：规格选择、本地状态、下载进度与完整性校验。"""
         from app.core import assets
 
-        card = Card("模型管理", "选择规格后点击下载：将依次获取 GGML 模型、whisper.cpp 二进制与 VAD 模型。未就绪时识别与采集功能不可用。")
+        card = Card(
+            "模型管理",
+            "选择规格后点击下载：将依次获取 GGML 模型、whisper.cpp 二进制与 VAD 模型。"
+            "下载完成后会自动启用识别后端；未就绪时识别与采集功能不可用。",
+        )
         self.model_spec = QComboBox()
         for spec in assets.MODELS:
             self.model_spec.addItem(f"{spec.key}（约 {spec.size_mb} MB · {spec.note}）", spec.key)
+        self.download_source = QComboBox()
+        self.download_source.addItem("官方 HuggingFace", "huggingface")
+        self.download_source.addItem("国内镜像 hf-mirror", "mirror")
+        source_index = self.download_source.findData(getattr(self.settings, "download_source", "huggingface"))
+        self.download_source.setCurrentIndex(max(0, source_index))
+        self.download_source.setToolTip("GGML 模型下载源；国内网络选镜像可显著提升速度")
         self.model_download_button = QPushButton("下载模型")
         self.model_download_button.setObjectName("primary")
         self.model_download_button.clicked.connect(
-            lambda: self.model_download.emit(self.model_spec.currentData())
+            lambda: self.model_download.emit(
+                self.model_spec.currentData(), self.download_source.currentData()
+            )
         )
+        self.model_verify_button = QPushButton("重新校验完整性")
+        self.model_verify_button.setToolTip("对本地资源做完整性校验，损坏的模型会被删除以便重新下载")
+        self.model_verify_button.clicked.connect(lambda: self.model_verify.emit())
         row = QHBoxLayout()
         row.addWidget(QLabel("规格"))
         row.addWidget(self.model_spec, 1)
+        row.addWidget(QLabel("下载源"))
+        row.addWidget(self.download_source, 1)
         row.addWidget(self.model_download_button)
+        row.addWidget(self.model_verify_button)
         card.box.addLayout(row)
 
         self.model_status = QLabel("检测中…")
         self.model_status.setObjectName("muted")
+        self.model_components = QLabel("资源状态：检测中…")
+        self.model_components.setObjectName("muted")
+        self.model_components.setWordWrap(True)
         self.model_progress = QProgressBar()
         self.model_progress.setRange(0, 100)
         self.model_progress.setValue(0)
@@ -334,6 +356,7 @@ class MainWindow(QMainWindow):
         self.model_progress_label.setObjectName("muted")
         self.model_progress_label.setWordWrap(True)
         card.box.addWidget(self.model_status)
+        card.box.addWidget(self.model_components)
         card.box.addWidget(self.model_progress)
         card.box.addWidget(self.model_progress_label)
         return card
@@ -348,6 +371,24 @@ class MainWindow(QMainWindow):
         self.set_capture_enabled(bool(data.get("ready")))
         if not data.get("ready"):
             self.model_progress_label.setText("模型未就绪，音频采集与识别功能已禁用")
+
+    def set_assets_detail(self, data):
+        """Shows the per-component readiness of the three ASR assets.
+
+        data: {'model': str, 'whisper': bool, 'vad': bool, 'ready': bool}
+        """
+        mark = lambda ok: "✓ 已就绪" if ok else "✗ 缺失"
+        lines = [
+            f"GGML 模型：{data.get('model') or '未下载'}",
+            f"whisper.cpp 二进制：{mark(bool(data.get('whisper')))}",
+            f"VAD 模型（Silero ONNX）：{mark(bool(data.get('vad')))}",
+        ]
+        self.model_components.setText("\n".join(lines))
+
+    def set_asr_model_path(self, path: str) -> None:
+        """Reflects the auto-discovered model path into the manual override field."""
+        if path and not self.asr_model.text().strip():
+            self.asr_model.setText(path)
 
     def set_model_status(self, text: str) -> None:
         self.model_status.setText(text)
