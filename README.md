@@ -13,6 +13,13 @@
 > 首次使用语音识别：在程序内点「下载模型」拉起 whisper 模型（一次性，之后离线可用）。
 > 本地翻译：需要本机 Ollama（已 pull 翻译模型）或任意 OpenAI 兼容服务（填自己的 API Key）。二者都不需要装插件，只需提供地址/密钥。
 
+## 维护者（发版 / 发布）
+
+- `docs/RELEASE.md` —— 一键发版脚本 `scripts/release.sh`（合规校验 → CHANGELOG → 回归门禁 → 打标签，失败自动回滚）
+- `docs/GITHUB_PUBLISHING.md` —— **GitHub 发布说明书**（推 `v*` 标签 → Actions 自动构建 → Releases 出包）
+
+简要流程：改版本号 → 构建便携包 → 提交推送 → 打 `v*` 标签并推送 → CI 自动把 zip 发布到 Releases。
+
 ## 安装运行（从源码）
 
 前置依赖：
