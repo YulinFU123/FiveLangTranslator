@@ -1,0 +1,39 @@
+name: release
+
+# 打 tag（如 v1.0.4）时自动构建 Windows 便携包并发布到 Releases。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:      # 也可在 Actions 页面手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write      # 上传 Release 附件需要
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e ".[audio,dev]"
+
+      - name: Build portable package
+        shell: pwsh
+        run: .\scripts\build.ps1
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist\FiveLangTranslator-*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

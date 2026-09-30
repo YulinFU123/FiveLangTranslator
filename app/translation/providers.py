@@ -41,6 +41,9 @@ class OllamaConfig:
     timeout: float = 60.0
     keep_alive: str = "15m"
     temperature: float = .2
+    # Cap on generated tokens. 0 = provider default (unbounded). Generation
+    # dominates a local round-trip, so a tighter cap is often the cheapest win.
+    max_tokens: int = 0
 
 
 class OllamaTranslationProvider(BaseTranslationProvider):
@@ -58,13 +61,17 @@ class OllamaTranslationProvider(BaseTranslationProvider):
 
     async def translate(self, job) -> ProviderResult:
         started = monotonic()
+        options = {"temperature": self.config.temperature}
+        if self.config.max_tokens and self.config.max_tokens > 0:
+            # Ollama spells max_tokens as options.num_predict.
+            options["num_predict"] = int(self.config.max_tokens)
         payload = {
             "model": self.config.model,
             "messages": build_messages(job),
             "stream": False,
             "think": False,
             "keep_alive": self.config.keep_alive,
-            "options": {"temperature": self.config.temperature},
+            "options": options,
         }
         response = await asyncio.to_thread(
             post_json,
@@ -96,6 +103,13 @@ class OpenAICompatibleConfig:
     api_key_environment: str = "OPENAI_API_KEY"
     timeout: float = 60.0
     temperature: float = .2
+    # Cap on generated tokens. 0 = provider default (unbounded).
+    max_tokens: int = 0
+    # Decrypted key from the local secret store. Takes priority over the
+    # environment variable so users can configure everything inside the UI.
+    api_key: str = ""
+    # Extra attempts after the first failure (network blips, 429 rate limits).
+    retries: int = 2
 
 
 class OpenAICompatibleTranslationProvider(BaseTranslationProvider):
@@ -106,28 +120,54 @@ class OpenAICompatibleTranslationProvider(BaseTranslationProvider):
 
     async def health_check(self) -> bool:
         try:
-            await asyncio.to_thread(get_json, self.config.base_url.rstrip("/") + "/models", 5.0)
+            await asyncio.to_thread(
+                get_json,
+                self.config.base_url.rstrip("/") + "/models",
+                10.0,
+                self._headers(),
+            )
             return True
         except Exception:
             return False
 
+    def _endpoint(self) -> str:
+        return self.config.base_url.rstrip("/") + "/chat/completions"
+
+    def _headers(self) -> dict:
+        """Explicit (DPAPI-decrypted) key wins over the environment variable."""
+        token = (self.config.api_key or "").strip() or os.environ.get(
+            self.config.api_key_environment, ""
+        )
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
     async def translate(self, job) -> ProviderResult:
         started = monotonic()
-        token = os.environ.get(self.config.api_key_environment, "")
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = self._headers()
         payload = {
             "model": self.config.model,
             "messages": build_messages(job),
             "stream": False,
             "temperature": self.config.temperature,
         }
-        response = await asyncio.to_thread(
-            post_json,
-            self.config.base_url.rstrip("/") + "/chat/completions",
-            payload,
-            self.config.timeout,
-            headers,
-        )
+        if self.config.max_tokens and self.config.max_tokens > 0:
+            payload["max_tokens"] = int(self.config.max_tokens)
+        attempts = max(1, int(self.config.retries) + 1)
+        response: dict | None = None
+        for attempt in range(attempts):
+            try:
+                response = await asyncio.to_thread(
+                    post_json, self._endpoint(), payload, self.config.timeout, headers
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - retried, then reported
+                if attempt >= attempts - 1:
+                    raise RuntimeError(
+                        f"{self.display_title or self.provider_id} 调用失败"
+                        f"（已重试 {self.config.retries} 次）：{exc}"
+                    ) from exc
+                await asyncio.sleep(min(2.0, 0.5 * (attempt + 1)))
+        if not response:
+            raise RuntimeError(f"{self.display_title or self.provider_id} 未返回内容")
         choices = response.get("choices") or []
         if not choices:
             raise RuntimeError("OpenAI Compatible服务未返回choices")

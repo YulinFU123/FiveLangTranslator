@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from time import monotonic
 
@@ -24,8 +26,15 @@ except Exception as _boot_err:  # noqa: BLE001
         pass
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
-from PySide6.QtWidgets import QApplication, QFileDialog, QMenu, QStyle, QSystemTrayIcon
+from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QMenu,
+    QMessageBox,
+    QStyle,
+    QSystemTrayIcon,
+)
 from qasync import QEventLoop
 
 from app.asr.service import ASRService
@@ -35,7 +44,12 @@ from app.controllers import DemoController, SubtitlePipelineController
 from app.core import paths
 from app.core.arbiter import ResultArbiter
 from app.core.events import EventBus
+from app.core.models import RecognitionResult, SourceType, SubtitleStatus
+from app.core.secrets import protect as protect_secret, unprotect as unprotect_secret
 from app.export.exporters import suggest_filename, write_export
+from app.vision.ocr_engine import WindowsOcrEngine
+from app.vision.region_window import OcrRegionWindow
+from app.vision.service import RegionOcrService
 from app.providers.mock import MockASR, MockTranslation
 from app.providers.registry import ProviderRegistry
 from app.settings import Store
@@ -46,6 +60,7 @@ from app.storage.glossary import GlossaryRepository
 from app.storage.session import HistoryService
 from app.storage.appearance import AppearanceRepository
 from app.translation.cache import PersistentTranslationCache
+from app.translation.context import DEFAULT_CONTEXT_SENTENCES
 from app.translation.registry import TranslationProviderRegistry, plan_from_settings
 from app.translation.service import TranslationService
 from app.ui.main_window import MainWindow
@@ -121,6 +136,8 @@ class Runtime:
         self.demo = DemoController(self.pipeline, self.registry)
         self.audio = AudioService()
         self.asr = ASRService(self.project_root)
+        self.ocr_region = OcrRegionWindow()
+        self.ocr_service = RegionOcrService(self.ocr_region)
         self._devices = []
         self.shortcuts = []
         self.global_hotkeys = GlobalHotkeyManager(app)
@@ -148,12 +165,19 @@ class Runtime:
         self.window.recover.connect(self.recover)
         self.window.audio_start.connect(self.audio_start)
         self.window.audio_stop.connect(self.audio.stop_capture)
+        self.window.audio_probe.connect(self.audio_probe)
+        self.window.audio_device_changed.connect(self.audio_switch_device)
         self.window.audio_refresh.connect(self.audio_refresh)
+        self.window.audio_gain_changed.connect(self.audio.set_gain)
         self.window.asr_apply.connect(self.configure_asr)
         self.window.asr_benchmark.connect(self.asr.run_benchmark)
+        self.window.asr_latency_changed.connect(self.set_segment_policy)
+        self.window.asr_draft_toggled.connect(self.set_draft_enabled)
         self.window.model_download.connect(self.download_model)
         self.window.model_verify.connect(self.verify_assets)
         self.window.translation_apply.connect(self.configure_translation)
+        self.window.deepseek_apply.connect(self.configure_deepseek)
+        self.window.deepseek_test.connect(self.test_deepseek)
         self.window.translation_test.connect(self.test_translation)
         self.audio.devices_changed.connect(self.audio_devices)
         self.audio.level_changed.connect(self.window.set_audio_level)
@@ -165,6 +189,29 @@ class Runtime:
         self.audio.draft_segment_ready.connect(self._audio_segment)
         self.audio.segment_ready.connect(self._audio_segment)
         self.asr.result_ready.connect(self.pipeline.submit_recognition)
+        self.asr.result_ready.connect(lambda result: self.window.set_chain_text(getattr(result, "text", "")))
+        # Recognition latency is logged by ASRService; log the translation leg here
+        # so a slow subtitle can be attributed to exactly one of the two.
+        self.translation.translated.connect(self._report_latency)
+        # Region OCR: recognised screen text enters the very same pipeline, so it
+        # is translated, shown on the overlay and recorded exactly like speech.
+        self.ocr_service.text_recognized.connect(self._on_ocr_text)
+        self.ocr_service.status_changed.connect(self.window.set_ocr_status)
+        self.window.ocr_toggle.connect(self.ocr_toggle)
+        self.window.ocr_pick_region.connect(self.ocr_pick_region)
+        self.window.ocr_interval.connect(self.ocr_service.set_interval)
+        self.window.ocr_lock.connect(self.ocr_region.set_locked)
+        # While recognition runs the frame is an adjustment aid only: leaving it up
+        # makes it blink on every capture (each grab hides it) and cover the content.
+        self.ocr_region.interaction_ended.connect(self._hide_ocr_frame_if_running)
+        self.window.ocr_language_changed.connect(self.ocr_service.set_language)
+        languages = WindowsOcrEngine.available_languages()
+        default = WindowsOcrEngine.default_language()
+        if languages and default:
+            self.ocr_service.set_language(default)
+            self.window.set_ocr_languages(languages, default)
+        else:
+            self.window.set_ocr_status("未安装 OCR 语言包：设置 → 时间和语言 → 语言")
         self.asr.backend_status.connect(self.window.set_asr_status)
         self.asr.metrics_changed.connect(self.window.set_asr_metrics)
         self.asr.language_state.connect(self.window.set_language_state)
@@ -175,6 +222,13 @@ class Runtime:
         self.translation.metrics_changed.connect(self.window.set_translation_metrics)
         self.translation.error.connect(self._report_translation_error)
         self.window.minimized_to_tray.connect(self._announce_tray)
+        self.window.quit_requested.connect(self.shutdown)
+        # Keep the chain panel live: a silent failure (capture running but ASR
+        # disabled) is otherwise indistinguishable from "it is working".
+        self._chain_timer = QTimer(self.app)
+        self._chain_timer.setInterval(1500)
+        self._chain_timer.timeout.connect(self._publish_chain)
+        self._chain_timer.start()
         self.window.history_start.connect(self.start_history)
         self.window.history_stop.connect(self.stop_history)
         self.window.history_select.connect(self.select_history_session)
@@ -205,6 +259,9 @@ class Runtime:
 
     async def initialize(self) -> None:
         await self.registry.initialize_all()
+        # Persisted ASR settings were never handed to the service on start-up, so
+        # a restart silently lost them. Apply (and auto-fill) them here.
+        self.apply_asr_settings()
         self.refresh_model_state()
         warmed = await asyncio.to_thread(self.translation_cache.warm_up, CACHE_WARM_UP_ENTRIES)
         if warmed:
@@ -284,6 +341,8 @@ class Runtime:
             ("Ctrl+Shift+E", self.edit), ("Ctrl+Shift+L", self.lock),
             ("Ctrl+Shift+P", self.through), ("Ctrl+Shift+O", self.visible),
             ("Ctrl+Shift+R", self.recover), ("Ctrl+Shift+D", self.demo.start),
+            ("Ctrl+=", lambda: self.adjust_font(2)),
+            ("Ctrl+-", lambda: self.adjust_font(-2)),
         ):
             shortcut = QShortcut(QKeySequence(sequence), self.window)
             shortcut.activated.connect(callback)
@@ -350,16 +409,101 @@ class Runtime:
         self.audio_refresh()
 
     def audio_refresh(self) -> None:
-        if not self._devices:
+        # Always re-enumerate. The old cache (`if not self._devices`) meant the
+        # list was fetched once and never picked up newly plugged devices, a new
+        # default, or a source switch.
+        try:
             self._devices = self.audio.list_devices()
+        except Exception as exc:  # noqa: BLE001 - report, never break the UI
+            self.window.set_audio_status(f"设备枚举失败：{exc}")
+            return
         self.window.set_audio_devices(self._devices)
+
+    def audio_switch_device(self) -> None:
+        """Re-opens capture on the newly chosen device while it is running.
+
+        Selecting a device used to have no effect until the next manual start,
+        which made the control look broken.
+        """
+        if not getattr(self.audio, "running", False):
+            self.window.set_audio_status("已选择设备：点「开始电平测试」或「开始采集」即生效")
+            return
+        device_id = self.window.audio_device.currentData()
+        kind = self.window.audio_kind.currentData()
+        try:
+            self.audio.start_capture(device_id, kind)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.window.set_audio_status(f"切换设备失败：{exc}")
+
+    def audio_probe(self, enabled: bool) -> None:
+        """Capture purely to visualise the input level.
+
+        Deliberately bypasses the "models ready" gate used by 开始采集: the user
+        must be able to confirm a device really receives audio *before*
+        downloading any ASR model. Nothing here feeds the recognition pipeline.
+        """
+        if enabled:
+            device_id = self.window.audio_device.currentData()
+            kind = self.window.audio_kind.currentData()
+            try:
+                self.audio.start_capture(device_id, kind)
+            except Exception as exc:  # noqa: BLE001 - report, keep the UI usable
+                self.window.set_audio_status(f"电平测试启动失败：{exc}")
+                self.window.audio_probe_btn.setChecked(False)
+                return
+            self.window.set_audio_status("电平测试进行中：请说话，观察电平条跳动")
+        else:
+            self.audio.stop_capture()
+            self.window.set_audio_status("电平测试已停止")
+
+    def set_draft_enabled(self, enabled: bool) -> None:
+        """Draft subtitles: nicer streaming, but each one is a full inference."""
+        self.settings.asr_draft_enabled = bool(enabled)
+        self.save()
+
+    def set_segment_policy(self, payload) -> None:
+        """Apply the latency/accuracy preset picked in the UI."""
+        if not payload:
+            return
+        self.audio.set_segment_policy(
+            min_silence_ms=payload.get("min_silence_ms"),
+            max_seconds=payload.get("max_seconds"),
+        )
+
+    def _publish_chain(self) -> None:
+        """Report each link of the chain so a dead ASR is never silent."""
+        capture = bool(self.audio.running)
+        asr = bool(self.asr.enabled)
+        details: list[str] = []
+        if not capture:
+            details.append("采集未启动 → 点「开始采集并识别」")
+        if not asr:
+            details.append("识别引擎未就绪 → 到「本地识别」点「检测并应用识别后端」")
+        if capture and asr:
+            details.append("链路已通：说话或播放音频后，「最近识别」会显示识别到的原文")
+        self.window.set_chain_state({
+            "capture": capture,
+            "asr": asr,
+            "translation": bool(getattr(self.settings, "translation_provider", "")),
+            "detail": "；".join(details),
+        })
 
     def audio_start(self, device_id, kind) -> None:
         from app.core import assets
 
-        if not assets.status().ready:
-            # 兜底拦截：模型未就绪时不允许开始采集
-            self.window.set_audio_status("模型未就绪：请先在「本地识别」页下载 GGML 模型与 whisper.cpp 二进制")
+        readiness = assets.status()
+        if not readiness.ready:
+            # Say exactly what is missing instead of a generic "not ready": the two
+            # prerequisites fail independently and need different user actions.
+            has_binary = bool(readiness.whisper_server or readiness.whisper_cli)
+            if readiness.installed_models and not has_binary:
+                hint = "模型已就绪，但缺少 whisper.cpp 二进制 → 请在「本地识别」页点「下载 whisper.cpp」"
+            elif has_binary and not readiness.installed_models:
+                hint = "whisper.cpp 已就绪，但缺少 GGML 模型 → 请在「本地识别」页下载 small 或 medium"
+            else:
+                hint = "请在「本地识别」页下载 GGML 模型与 whisper.cpp 二进制"
+            self.window.set_audio_status(f"模型未就绪：{hint}")
+            self.window.open_recognition_tab()
             return
         source = AudioSourceKind.SYSTEM_LOOPBACK if kind == "system_loopback" else AudioSourceKind.MICROPHONE
         self.settings.audio_kind = kind
@@ -367,6 +511,13 @@ class Runtime:
         self.settings.preferred_device_name = selected.name if selected else ""
         self.save()
         self.audio.start_capture(device_id, source)
+        self._publish_chain()
+        if not self.asr.enabled:
+            # Say it now, not only after a VAD segment: with a quiet source the
+            # segment never arrives and the user is left with zero feedback.
+            self.window.set_audio_status(
+                "已开始采集，但识别引擎未就绪 → 不会有字幕；请到「本地识别」点「检测并应用识别后端」"
+            )
         if self.settings.auto_record_sessions:
             self.start_history({
                 "source_type": source.value,
@@ -377,11 +528,21 @@ class Runtime:
 
     def _audio_segment(self, segment) -> None:
         if self.asr.enabled:
+            # Every call costs about the same (whisper pads to a 30 s window), so
+            # drafts are pure overhead on CPU and delay the final subtitle.
+            if not segment.is_final and not self.settings.asr_draft_enabled:
+                return
             self.asr.submit(segment)
         elif segment.is_final:
             # Do not auto-start the demo: it would pop a subtitle box without the
             # user's intent. Trigger it from the dashboard button / hotkey instead.
             self.window.set_asr_status("whisper.cpp 未配置，点击「播放模拟实时字幕」体验演示")
+
+    def _report_latency(self, result) -> None:
+        """Log the translation leg (recognition is logged by ASRService)."""
+        latency = int(getattr(result, "latency_ms", 0) or 0)
+        text = (getattr(result, "translated_text", "") or "")[:30]
+        logger.info("[翻译] %d ms · %s", latency, text)
 
     def configure_asr(self, payload) -> None:
         self.settings.whisper_executable = payload.get("executable", "")
@@ -393,7 +554,36 @@ class Runtime:
         self.settings.whisper_server_executable = payload.get("server_executable", "")
         self.settings.whisper_server_port = int(payload.get("server_port", 8178))
         self.settings.whisper_server_fallback = bool(payload.get("server_fallback", True))
+        self.settings.asr_beam_size = int(payload.get("beam_size", 1) or 1)
         self.save()
+        self.apply_asr_settings()
+
+    def _fill_asr_defaults(self) -> None:
+        """Fills blank ASR paths from the assets already installed on disk.
+
+        The download flow installs whisper.cpp and the GGML model into the data
+        directory but leaves the settings fields empty. Without this the
+        recogniser has nothing to execute, so capture runs while no transcript is
+        ever produced -- which looks exactly like "recognition is broken".
+        """
+        from app.core import assets
+
+        readiness = assets.status()
+        if not self.settings.whisper_executable:
+            self.settings.whisper_executable = readiness.whisper_cli
+        if not self.settings.whisper_server_executable:
+            self.settings.whisper_server_executable = readiness.whisper_server
+        if not self.settings.whisper_model and readiness.installed_models:
+            models_dir = Path(readiness.models_dir)
+            for spec in assets.MODELS:
+                candidate = models_dir / spec.filename
+                if spec.key in readiness.installed_models and candidate.is_file():
+                    self.settings.whisper_model = str(candidate)
+                    break
+
+    def apply_asr_settings(self) -> None:
+        """Pushes ASR settings into the service, filling any gaps first."""
+        self._fill_asr_defaults()
         self.asr.configure(
             self.settings.whisper_executable,
             self.settings.whisper_model,
@@ -404,6 +594,7 @@ class Runtime:
             self.settings.whisper_server_executable,
             self.settings.whisper_server_port,
             self.settings.whisper_server_fallback,
+            self.settings.asr_beam_size,
         )
 
     def refresh_model_state(self) -> None:
@@ -521,6 +712,13 @@ class Runtime:
         data = payload if isinstance(payload, dict) else {}
         self.settings.translation_target_language = data.get("target_language", self.settings.translation_target_language)
         self.settings.translation_style = data.get("style", self.settings.translation_style)
+        self.settings.translation_max_tokens = int(data.get("max_tokens", self.settings.translation_max_tokens) or 0)
+        self.settings.translation_context_sentences = int(
+            data.get(
+                "context_sentences",
+                getattr(self.settings, "translation_context_sentences", DEFAULT_CONTEXT_SENTENCES),
+            ) or 0
+        )
         if "ollama_url" in data:
             self.settings.ollama_url = data.get("ollama_url", self.settings.ollama_url)
             self.settings.ollama_model = data.get("ollama_model", self.settings.ollama_model)
@@ -543,13 +741,78 @@ class Runtime:
         self.apply_translation_settings()
         self.save()
 
+    def configure_deepseek(self, payload: dict) -> None:
+        """Encrypts and persists the DeepSeek endpoint/key, then applies it live."""
+        data = dict(payload or {})
+        endpoints = dict(getattr(self.settings, "translation_endpoints", None) or {})
+        entry = {
+            "base_url": str(data.get("base_url", "") or ""),
+            "model": str(data.get("model", "") or ""),
+            "timeout": float(data.get("timeout", 60.0) or 60.0),
+            "retries": int(data.get("retries", 2) or 2),
+        }
+        endpoints["deepseek"] = entry
+        self.settings.translation_endpoints = endpoints
+        key = str(data.get("api_key", "") or "").strip()
+        if key:
+            try:
+                self.settings.api_key_secrets["deepseek"] = protect_secret(key)
+            except Exception as exc:  # noqa: BLE001 - never store a key unencrypted
+                self.window.set_deepseek_status(f"密钥加密保存失败，未写入：{exc}")
+                return
+        chain = list(getattr(self.settings, "translation_chain", None) or [])
+        if "deepseek" not in chain:
+            chain.append("deepseek")
+            self.settings.translation_chain = chain
+        self.apply_translation_settings()
+        self.save()
+        self.window.set_deepseek_status(
+            "已保存并生效：API Key 经 Windows DPAPI 加密，DeepSeek 已加入回退链"
+        )
+
+    def test_deepseek(self, payload: dict) -> None:
+        """Saves the entry, then runs the standard provider connection test."""
+        data = dict(payload or {})
+        key = str(data.get("api_key", "") or "").strip()
+        if key:
+            try:
+                self.settings.api_key_secrets["deepseek"] = protect_secret(key)
+            except Exception:  # noqa: BLE001 - test still runs with the env key
+                pass
+        self.configure_deepseek(data)
+        self.test_translation({
+            "provider_id": "deepseek",
+            "base_url": str(data.get("base_url", "") or ""),
+            "model": str(data.get("model", "") or ""),
+        })
+
+    def _inject_api_keys(self, plan) -> None:
+        """Attaches DPAPI-decrypted API keys to the providers that declare one.
+
+        Keys never sit in settings.json as plaintext; they are decrypted here, in
+        memory only, right before the provider objects are built.
+        """
+        encrypted = dict(getattr(self.settings, "api_key_secrets", None) or {})
+        for entry in plan:
+            provider_id = entry.get("provider_id", "")
+            cipher = encrypted.get(provider_id, "")
+            if not cipher:
+                continue
+            options = entry.setdefault("options", {})
+            options["api_key"] = unprotect_secret(cipher)
+
     def apply_translation_settings(self) -> None:
         plan = plan_from_settings(self.settings)
+        self._inject_api_keys(plan)
         missing = [item for item in plan if item["provider_id"] not in self.translation_registry.presets]
         plan = [item for item in plan if item["provider_id"] in self.translation_registry.presets]
         self.translation.set_language_pair(
             self.settings.translation_target_language,
             self.settings.translation_style,
+        )
+        # Prompt-context window: fewer sentences = fewer tokens = faster inference.
+        self.translation.set_context_sentences(
+            int(getattr(self.settings, "translation_context_sentences", DEFAULT_CONTEXT_SENTENCES) or 0)
         )
         self.translation.set_providers(self.translation_registry.build_chain(plan))
         self.history.configure(
@@ -567,6 +830,51 @@ class Runtime:
         if self.translation.set_max_lines(lines):
             message = f"字幕框可视行数 {self.translation.max_lines} 行 · 译文长度约束已更新"
             self.window.statusBar().showMessage(message)
+
+    def ocr_pick_region(self) -> None:
+        """Shows the OCR frame pinned above other windows so it is actually visible."""
+        self.ocr_region.reveal()
+        self.window.set_ocr_status(
+            "调整识别框：拖动内部移动，拖边角缩放 · 「开始识别」后框自动隐藏（避免遮挡与每秒闪烁），"
+            "「停止识别」也会关闭框；需要重新调整再点「选择区域」"
+        )
+
+    def ocr_toggle(self, enabled: bool) -> None:
+        """Starts or stops the periodic region recognition."""
+        if enabled:
+            if not self.ocr_region.isVisible():
+                self.ocr_pick_region()
+            self.ocr_service.start()
+            # The frame exists only for positioning: once recognition runs it has to
+            # go, otherwise it blinks once per capture and sits over the content.
+            self.ocr_region.hide()
+        else:
+            self.ocr_service.stop()
+            # Stopping must dismiss the frame too -- it used to stay on screen
+            # forever because nothing ever hid it.
+            self.ocr_region.hide()
+
+    def _hide_ocr_frame_if_running(self) -> None:
+        """Hides the adjustment frame again once the user lets go (while running)."""
+        if self.ocr_service.running:
+            self.ocr_region.hide()
+
+    def _on_ocr_text(self, text: str) -> None:
+        """Feeds recognised region text into the pipeline as an OCR result."""
+        now_ms = int(monotonic() * 1000)
+        result = RecognitionResult(
+            segment_id=f"ocr-{now_ms}",
+            revision=1,
+            text=text,
+            language=self.ocr_service.engine.language_tag,
+            confidence=1.0,
+            start_ms=now_ms,
+            end_ms=now_ms,
+            status=SubtitleStatus.FINAL,
+            provider="windows-ocr",
+            source=SourceType.OCR,
+        )
+        self.pipeline.submit_recognition(result)
 
     def set_topmost(self, enabled: bool) -> None:
         """User/code request to change always-on-top. Persists, broadcasts, toasts."""
@@ -718,6 +1026,25 @@ class Runtime:
         self.window.apply_theme_mode(mode)
         # Colours follow the Windows light/dark theme until the user customises them.
         self.style_manager.apply_theme_defaults(mode)
+        self._apply_window_material(mode)
+
+    def _apply_window_material(self, light: bool) -> None:
+        """Tints the native frame and rounds the corners to match the theme.
+
+        Deliberately does NOT use ``WA_TranslucentBackground``: that turns the
+        window into a layered surface which Qt never paints, and unless the
+        Windows 11 Mica backdrop happens to be available it renders pure black.
+        The frosted look is produced by translucent cards over an opaque
+        gradient instead, which is stable on every Windows version.
+        """
+        try:
+            from app.windows import window_styles
+
+            hwnd = int(self.window.winId())
+            window_styles.set_immersive_dark(hwnd, not light)
+            window_styles.set_rounded_corners(hwnd, True)
+        except Exception:
+            pass
 
     def _install_theme_watcher(self) -> None:
         self.theme_watcher = ThemeWatcher()
@@ -756,20 +1083,26 @@ class Runtime:
         provider_id = str(data.get("provider_id", "") or "")
         if not provider_id:
             provider_id = self.settings.translation_chain[0] if self.settings.translation_chain else "ollama"
+        # A key saved from the panel is stored DPAPI-encrypted; it must feed both
+        # the provider and the presence check, otherwise the UI always reports
+        # "no key detected" even right after saving one.
+        encrypted = dict(getattr(self.settings, "api_key_secrets", None) or {})
+        stored_key = unprotect_secret(encrypted.get(provider_id, ""))
         try:
             preset = self.translation_registry.get(provider_id)
             provider = self.translation_registry.create(
                 provider_id,
                 str(data.get("base_url", "") or ""),
                 str(data.get("model", "") or ""),
+                {"api_key": stored_key},
             )
         except Exception as exc:
             self.window.set_translation_status(f"连接测试失败：{exc}")
             self.window.show_toast(f"连接测试失败：{exc}", ok=False)
             return
 
-        if preset.requires_api_key and not os.environ.get(preset.api_key_environment, ""):
-            message = f"未检测到密钥：请先在当前终端设置 {preset.api_key_environment}"
+        if preset.requires_api_key and not (stored_key or os.environ.get(preset.api_key_environment, "")):
+            message = f"未检测到密钥：请在面板填写，或设置环境变量 {preset.api_key_environment}"
             self.window.set_translation_status(message)
             self.window.show_toast(message, ok=False)
             return
@@ -803,6 +1136,26 @@ class Runtime:
         self.overlay.set_locked(not self.overlay.locked)
         self._state()
 
+    def adjust_font(self, delta: int) -> None:
+        """Quick subtitle font-size stepper, bound to Ctrl+= / Ctrl+-.
+
+        Locked or click-through boxes keep their size on purpose: locking means
+        the layout is fixed, so the shortcut is a no-op rather than silently
+        fighting the lock.
+        """
+        overlay = self.overlay
+        if overlay.locked or overlay.through:
+            return
+        manager = overlay.style_manager
+        if manager is None:
+            return
+        current = manager.get_style().subtitle_font_size
+        new_size = max(8, min(72, current + delta))
+        if new_size == current:
+            return
+        manager.update(subtitle_font_size=new_size)
+        self.window.statusBar().showMessage(f"字幕字号 {new_size}")
+
     def through(self) -> None:
         self.overlay.set_through(not self.overlay.through)
         self._state()
@@ -813,6 +1166,7 @@ class Runtime:
     def recover(self) -> None:
         self.overlay.set_through(False)
         self.overlay.set_locked(False)
+        self.overlay.reset_size()
         self.overlay.apply_profile(self.overlay.fullscreen_mode, self.overlay.player_rect)
         self.overlay.show()
         self.overlay.raise_()
@@ -827,18 +1181,71 @@ class Runtime:
         self.store.save(self.settings)
 
     def shutdown(self) -> None:
+        """Tear everything down and leave the process.
+
+        Re-entrant guard: the tray menu and the in-app button can both fire it.
+        A watchdog backs every path, because a single blocked await below (the
+        whisper-server subprocess) used to leave FiveLangTranslator.exe alive in
+        the tray forever, which then locked dist and broke the next build.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+        threading.Thread(target=self._exit_watchdog, name="exit-watchdog", daemon=True).start()
         asyncio.create_task(self._shutdown_async())
 
+    def _exit_watchdog(self) -> None:
+        """Last resort: never leave a zombie holding the dist folder."""
+        deadline = monotonic() + 10.0
+        while monotonic() < deadline:
+            time.sleep(0.5)
+        os._exit(0)
+
     async def _shutdown_async(self) -> None:
-        self.player_tracker.stop()
-        self.global_hotkeys.unregister_all()
-        self.audio.close()
-        self.translation.cancel_all()
-        self.history.end_session()
-        self.save()
-        await self.asr.close()
-        self.history.close()
-        self.app.quit()
+        try:
+            await self._teardown()
+        finally:
+            # app.quit() must run even if a teardown step blew up, otherwise the
+            # process would stay alive with no visible window.
+            self.app.quit()
+
+    async def _teardown(self) -> None:
+        for step in (
+            lambda: self.player_tracker.stop(),
+            lambda: self.global_hotkeys.unregister_all(),
+            lambda: self.audio.close(),
+            lambda: self.translation.cancel_all(),
+            lambda: self.history.end_session(),
+            self.save,
+        ):
+            try:
+                step()
+            except Exception:
+                pass
+        server = getattr(self.asr, "server_process", None)
+        child = getattr(server, "process", None) if server is not None else None
+        # Bounded: awaiting asr.close() with no timeout was the reason an exit
+        # request could never reach app.quit().
+        try:
+            await asyncio.wait_for(self.asr.close(), 4.0)
+        except Exception:
+            pass
+        self._kill_child(child)
+        self._kill_child(getattr(getattr(self.asr, "server_process", None), "process", None))
+        try:
+            self.history.close()
+        except Exception:
+            pass
+
+    def _kill_child(self, process) -> None:
+        """Make sure the whisper-server subprocess never outlives the app."""
+        if process is None:
+            return
+        try:
+            if process.returncode is None:
+                process.kill()
+        except Exception:
+            pass
 
 
 async def boot(runtime: Runtime) -> None:
@@ -847,9 +1254,47 @@ async def boot(runtime: Runtime) -> None:
     QTimer.singleShot(500, runtime.show_startup_hint)
 
 
+def _already_running() -> bool:
+    """True when another instance already owns the single-instance mutex.
+
+    Relaunching used to pile up extra processes that lingered in the tray and
+    kept dist locked, so a second copy now refuses to start instead.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        # The handle is deliberately never closed: it stays owned for the whole
+        # process lifetime, and Windows releases it on exit.
+        kernel32.CreateMutexW(None, True, "FiveLangTranslator_SingleInstance")
+        return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
 def main() -> int:
+    # Honour fractional scaling (125% / 150%) exactly instead of rounding it to a
+    # whole factor. Qt's default rounding policy makes it render at a scale that
+    # does not match the display, which oversizes every widget relative to the
+    # window and clips the control centre unless it is maximised. Must be set
+    # before the application object is created.
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    if _already_running():
+        QMessageBox.information(
+            None,
+            "FiveLangTranslator",
+            "程序已经在运行了（通常在右下角系统托盘里）。\n\n"
+            "请先右键托盘图标 → 退出，再重新启动；\n"
+            "若托盘找不到，用任务管理器结束 FiveLangTranslator.exe。",
+        )
+        return 0
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
     runtime = Runtime(app)

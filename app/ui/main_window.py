@@ -4,14 +4,15 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QProgressBar, QPushButton, QSpinBox, QTabWidget, QTableWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QFrame,
+    QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QProgressBar, QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from app.export.exporters import CONTENT_MODES, clock_timestamp as ms_to_clock
-from app.translation.registry import LEGACY_ENDPOINT_FIELDS, PRESETS
+from app.translation.registry import DEEPSEEK_BASE_URL, LEGACY_ENDPOINT_FIELDS, PRESETS
 from app.ui.metrics import MetricRow, Sparkline
 from app.ui.overlay.anchor import ANCHOR_ORDER, ANCHOR_TIPS
 from app.ui.style_panel import StylePanel
@@ -54,7 +55,7 @@ class Card(QFrame):
         self.box.setContentsMargins(20, 18, 20, 18)
         self.box.setSpacing(10)
         heading = QLabel(title)
-        heading.setStyleSheet("font-size:16px;font-weight:700")
+        heading.setStyleSheet("font-size:15px;font-weight:700;letter-spacing:0.2px")
         self.box.addWidget(heading)
         if subtitle:
             description = QLabel(subtitle)
@@ -74,12 +75,19 @@ class MainWindow(QMainWindow):
     audio_start = Signal(object, object)
     audio_stop = Signal()
     audio_refresh = Signal()
+    audio_probe = Signal(bool)
+    audio_gain_changed = Signal(float)
+    audio_device_changed = Signal()
     asr_apply = Signal(object)
     asr_benchmark = Signal(str)
+    asr_latency_changed = Signal(object)
+    asr_draft_toggled = Signal(bool)
     model_download = Signal(str, str)
     model_verify = Signal()
     translation_apply = Signal(object)
     translation_test = Signal(object)
+    deepseek_apply = Signal(object)
+    deepseek_test = Signal(object)
     history_start = Signal(object)
     history_stop = Signal()
     history_select = Signal(str)
@@ -93,8 +101,14 @@ class MainWindow(QMainWindow):
     glossary_import = Signal(str)
     glossary_export = Signal(str)
     topmost_toggled = Signal(bool)
+    ocr_toggle = Signal(bool)
+    ocr_pick_region = Signal()
+    ocr_interval = Signal(float)
+    ocr_lock = Signal(bool)
+    ocr_language_changed = Signal(str)
     anchor_selected = Signal(str)
     minimized_to_tray = Signal()
+    quit_requested = Signal()
 
     def __init__(self, settings, overlay, style_manager=None, bus=None, preset_manager=None) -> None:
         super().__init__()
@@ -106,8 +120,8 @@ class MainWindow(QMainWindow):
         self.translation_dirty = False
         self.setWindowTitle("FiveLang Translator")
         self.resize(1120, 760)
-        self.setMinimumSize(940, 650)
         self._build()
+        self._apply_content_floor()
         self.sync()
         self.toast = Toast(self.centralWidget())
         self.toast.pop("控制中心已就绪", ok=True)
@@ -129,19 +143,76 @@ class MainWindow(QMainWindow):
         header.addLayout(text)
         header.addStretch()
         self.status_pill = QLabel("● v0.4.0 Alpha 2")
-        self.status_pill.setStyleSheet("background:#123326;color:#6ee7b7;padding:8px 13px;border-radius:12px;font-weight:700")
+        pill = current_tokens()
+        self.status_pill.setStyleSheet(
+            f"background:{pill['card']};color:{pill['accent']};"
+            f"border:1px solid {pill['card_border']};"
+            f"padding:8px 14px;border-radius:13px;font-weight:700"
+        )
         header.addWidget(self.status_pill)
         root.addLayout(header)
         tabs = QTabWidget()
-        tabs.addTab(self._dashboard(), "概览")
-        tabs.addTab(self._audio_page(), "音频与VAD")
-        tabs.addTab(self._asr_page(), "本地识别")
-        tabs.addTab(self._translation_page(), "翻译")
-        tabs.addTab(self._glossary_page(), "术语表")
-        tabs.addTab(self._history_page(), "历史与导出")
-        tabs.addTab(self._style_page(), "字幕样式")
+        # Every page is wrapped in a scroll area: without one Qt squeezes each
+        # child below its sizeHint when the window is small, which is what made
+        # the controls overlap and clip unless the window was maximised.
+        tabs.addTab(self._scrollable(self._dashboard()), "概览")
+        tabs.addTab(self._scrollable(self._audio_page()), "音频与VAD")
+        self._asr_widget = self._asr_page()
+        tabs.addTab(self._scrollable(self._asr_widget), "本地识别")
+        tabs.addTab(self._scrollable(self._translation_page()), "翻译")
+        tabs.addTab(self._scrollable(self._glossary_page()), "术语表")
+        tabs.addTab(self._scrollable(self._history_page()), "历史与导出")
+        tabs.addTab(self._scrollable(self._style_page()), "字幕样式")
+        self.tabs = tabs
         root.addWidget(tabs, 1)
-        self.statusBar().showMessage("准备就绪 · Ctrl+Shift+D 播放模拟字幕")
+        # The tray menu used to be the only way out, and closing the window only
+        # collapsed to the tray, so stale processes piled up. Give the window an
+        # explicit, visible exit as well.
+        footer = QHBoxLayout()
+        footer.addStretch()
+        hint = QLabel("关闭窗口只会缩到系统托盘，彻底结束请点「退出程序」")
+        hint.setObjectName("muted")
+        footer.addWidget(hint)
+        quit_button = QPushButton("退出程序")
+        quit_button.setToolTip("停止识别、结束 whisper-server 子进程并完全退出")
+        quit_button.clicked.connect(self.quit_requested.emit)
+        footer.addWidget(quit_button)
+        root.addLayout(footer)
+        self.statusBar().showMessage("准备就绪 · Ctrl+=/- 调整字号 · Ctrl+Shift+D 播放模拟字幕")
+
+    def _scrollable(self, page: QWidget) -> QScrollArea:
+        """Wraps a page so it scrolls instead of being squeezed below its minimum.
+
+        A resizable scroll area keeps the page at its own minimum size and reveals
+        scrollbars when the window is smaller, so controls never compress or
+        overlap no matter the window size or DPI scale.
+        """
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        area.setWidget(page)
+        return area
+
+    def _apply_content_floor(self) -> None:
+        """Derives the window floor from real content, clamped to the screen.
+
+        On a small or high-DPI display a hard-coded floor can be larger than the
+        work area, so the value is capped to the screen: the scroll areas then
+        absorb the overflow instead of the layout collapsing.
+        """
+        central = self.centralWidget()
+        layout = central.layout() if central is not None else None
+        hint = layout.minimumSize() if layout is not None else None
+        width = max(940, hint.width() if hint is not None else 0)
+        height = max(650, hint.height() if hint is not None else 0)
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        if available is not None:
+            width = min(width, max(360, available.width() - 80))
+            height = min(height, max(260, available.height() - 80))
+        self.setMinimumSize(width, height)
+        if self.width() < width or self.height() < height:
+            self.resize(width, height)
 
     def _dashboard(self):
         page = QWidget()
@@ -179,7 +250,129 @@ class MainWindow(QMainWindow):
             buttons.addWidget(button, index // 2, index % 2)
         controls.box.addLayout(buttons)
         grid.addWidget(controls, 1, 0, 1, 2)
+        size = Card("字幕区域尺寸", "精确设置宽高并立即生效；也可直接用鼠标拖拽字幕框四边 / 四角缩放。")
+        size_row = QHBoxLayout()
+        self.subtitle_width = QSpinBox()
+        self.subtitle_width.setRange(160, 7680)
+        self.subtitle_width.setSuffix(" px")
+        self.subtitle_height = QSpinBox()
+        self.subtitle_height.setRange(48, 4320)
+        self.subtitle_height.setSuffix(" px")
+        apply_size = QPushButton("应用尺寸")
+        apply_size.clicked.connect(self._apply_subtitle_size)
+        size_row.addWidget(QLabel("宽"))
+        size_row.addWidget(self.subtitle_width, 1)
+        size_row.addWidget(QLabel("高"))
+        size_row.addWidget(self.subtitle_height, 1)
+        size_row.addWidget(apply_size)
+        size.box.addLayout(size_row)
+        grid.addWidget(size, 2, 0, 1, 2)
+        ocr = Card("区域 OCR 识别", "框选屏幕任意区域，按设定间隔持续识别其中文字并自动送翻译。")
+        ocr_row = QHBoxLayout()
+        self.ocr_pick_btn = QPushButton("选择区域")
+        self.ocr_start_btn = QPushButton("开始识别")
+        self.ocr_stop_btn = QPushButton("停止识别")
+        self.ocr_lock_btn = QPushButton("锁定区域")
+        self.ocr_pick_btn.clicked.connect(self.ocr_pick_region)
+        self.ocr_start_btn.clicked.connect(lambda: self.ocr_toggle.emit(True))
+        self.ocr_stop_btn.clicked.connect(lambda: self.ocr_toggle.emit(False))
+        self.ocr_lock_btn.clicked.connect(self._toggle_ocr_lock)
+        for button in (self.ocr_pick_btn, self.ocr_start_btn, self.ocr_stop_btn, self.ocr_lock_btn):
+            ocr_row.addWidget(button)
+        ocr.box.addLayout(ocr_row)
+        ocr_row2 = QHBoxLayout()
+        self.ocr_interval_spin = QDoubleSpinBox()
+        self.ocr_interval_spin.setRange(0.2, 30.0)
+        self.ocr_interval_spin.setSingleStep(0.5)
+        self.ocr_interval_spin.setValue(1.0)
+        self.ocr_interval_spin.setSuffix(" s")
+        self.ocr_interval_spin.editingFinished.connect(
+            lambda: self.ocr_interval.emit(self.ocr_interval_spin.value())
+        )
+        self.ocr_language = QComboBox()
+        self.ocr_language.currentIndexChanged.connect(self._emit_ocr_language)
+        ocr_row2.addWidget(QLabel("间隔"))
+        ocr_row2.addWidget(self.ocr_interval_spin, 1)
+        ocr_row2.addWidget(QLabel("语言"))
+        ocr_row2.addWidget(self.ocr_language, 1)
+        ocr.box.addLayout(ocr_row2)
+        self.ocr_status = QLabel("未启动")
+        self.ocr_status.setObjectName("muted")
+        ocr.box.addWidget(self.ocr_status)
+        grid.addWidget(ocr, 3, 0, 1, 2)
         return page
+
+    def _toggle_ocr_lock(self) -> None:
+        """Flips the region lock state and mirrors it on the button text."""
+        locked = not getattr(self, "_ocr_locked", False)
+        self._ocr_locked = locked
+        self.ocr_lock_btn.setText("解锁区域" if locked else "锁定区域")
+        self.ocr_lock.emit(locked)
+
+    def _emit_ocr_language(self) -> None:
+        data = self.ocr_language.currentData()
+        if data:
+            self.ocr_language_changed.emit(data)
+
+    def set_ocr_status(self, text: str) -> None:
+        """Shows the current region-OCR state in the control centre."""
+        if getattr(self, "ocr_status", None) is not None:
+            self.ocr_status.setText(text)
+
+    def set_ocr_languages(self, languages, current: str = "") -> None:
+        """Fills the language combo with the OCR languages Windows provides."""
+        if getattr(self, "ocr_language", None) is None:
+            return
+        self.ocr_language.blockSignals(True)
+        self.ocr_language.clear()
+        for tag, name in languages:
+            self.ocr_language.addItem(f"{name} ({tag})", tag)
+        if current:
+            index = self.ocr_language.findData(current)
+            if index >= 0:
+                self.ocr_language.setCurrentIndex(index)
+        self.ocr_language.blockSignals(False)
+
+    def _apply_subtitle_size(self) -> None:
+        """Pushes the numeric box size from the panel onto the overlay."""
+        self.overlay.set_user_size(self.subtitle_width.value(), self.subtitle_height.value())
+        self.toast.pop("字幕区域尺寸已应用", ok=True)
+
+    def _sync_subtitle_size(self) -> None:
+        """Keeps the numeric size inputs in step with the real box geometry."""
+        width = getattr(self, "subtitle_width", None)
+        height = getattr(self, "subtitle_height", None)
+        if width is None or height is None:
+            return
+        # Never fight the user while they are typing in the spin boxes.
+        if width.hasFocus() or height.hasFocus():
+            return
+        # Defensive: test doubles may not expose real geometry.
+        overlay_width = getattr(self.overlay, "width", None)
+        overlay_height = getattr(self.overlay, "height", None)
+        if not callable(overlay_width) or not callable(overlay_height):
+            return
+        width.setValue(max(width.minimum(), overlay_width()))
+        height.setValue(max(height.minimum(), overlay_height()))
+
+    def set_chain_state(self, data: dict) -> None:
+        """Show which link is live, so 'nothing happens' is never silent."""
+        capture = bool(data.get("capture"))
+        asr = bool(data.get("asr"))
+        translation = bool(data.get("translation"))
+        mark = lambda ok, name: f"{name} {'✔' if ok else '✘'}"
+        self.chain_label.setText(
+            f"{mark(capture,'采集')} · {mark(asr,'识别')} · {mark(translation,'翻译')}"
+        )
+        palette = current_tokens()
+        self.chain_label.setStyleSheet(
+            "font-weight:700;color:%s"
+            % (palette["accent"] if (capture and asr) else palette["danger"])
+        )
+        self.chain_detail.setText(data.get("detail") or "")
+
+    def set_chain_text(self, text: str) -> None:
+        self.chain_text.setText(f"最近识别  {text or '--'}")
 
     def _audio_page(self):
         page = QWidget()
@@ -191,6 +384,9 @@ class MainWindow(QMainWindow):
         self.audio_kind.addItem("麦克风", "microphone")
         self.audio_kind.currentIndexChanged.connect(lambda: self.audio_refresh.emit())
         self.audio_device = QComboBox()
+        # `activated` (not currentIndexChanged) so the programmatic refill in
+        # set_audio_devices never fires a spurious device switch.
+        self.audio_device.activated.connect(lambda _index: self.audio_device_changed.emit())
         refresh = QPushButton("刷新设备")
         refresh.clicked.connect(self.audio_refresh)
         self.audio_refresh_button = refresh
@@ -201,8 +397,11 @@ class MainWindow(QMainWindow):
         row.addWidget(refresh)
         input_card.box.addLayout(row)
         actions = QHBoxLayout()
-        start = QPushButton("开始采集")
+        # The name spells out that capture runs the whole chain (VAD -> ASR ->
+        # translation -> overlay); there is no separate "start recognition" step.
+        start = QPushButton("开始采集并识别")
         start.setObjectName("primary")
+        start.setToolTip("开始后自动完成：采集 → 人声检测 → 识别 → 翻译 → 字幕上屏")
         stop = QPushButton("停止采集")
         start.clicked.connect(lambda: self.audio_start.emit(self.audio_device.currentData(), self.audio_kind.currentData()))
         stop.clicked.connect(self.audio_stop)
@@ -213,7 +412,39 @@ class MainWindow(QMainWindow):
         actions.addWidget(stop)
         actions.addStretch()
         input_card.box.addLayout(actions)
+        # Virtual cables and some system loopbacks deliver audio near -50 dBFS,
+        # where Silero reports 0% speech and nothing ever reaches whisper. This
+        # lifts the signal before VAD and recognition.
+        gain_row = QHBoxLayout()
+        gain_row.addWidget(QLabel("输入增益"))
+        self.audio_gain = QSpinBox()
+        self.audio_gain.setRange(0, 30)
+        self.audio_gain.setValue(0)
+        self.audio_gain.setSuffix(" dB")
+        self.audio_gain.setToolTip("电平偏低（人声概率一直是 0%）时调高，例如 15~25 dB")
+        self.audio_gain.valueChanged.connect(lambda v: self.audio_gain_changed.emit(float(v)))
+        gain_row.addWidget(self.audio_gain)
+        gain_hint = QLabel("人声概率一直 0%、音量约 -50 dBFS 时，把这里调到 15~25 dB")
+        gain_hint.setObjectName("muted")
+        gain_hint.setWordWrap(True)
+        gain_row.addWidget(gain_hint)
+        gain_row.addStretch()
+        input_card.box.addLayout(gain_row)
         layout.addWidget(input_card)
+        chain = Card("语音翻译链路", "每一步实时更新；✘ 表示这一环没通，按提示处理即可。")
+        self.chain_label = QLabel("采集 ✘ · 识别 ✘ · 翻译 ✘")
+        self.chain_label.setStyleSheet(
+            "font-weight:700;color:%s" % current_tokens()["danger"]
+        )
+        self.chain_detail = QLabel("点「开始采集并识别」后，这里会告诉你卡在哪一环。")
+        self.chain_detail.setObjectName("muted")
+        self.chain_detail.setWordWrap(True)
+        self.chain_text = QLabel("最近识别  --")
+        self.chain_text.setWordWrap(True)
+        chain.box.addWidget(self.chain_label)
+        chain.box.addWidget(self.chain_detail)
+        chain.box.addWidget(self.chain_text)
+        layout.addWidget(chain)
         live = Card("实时检测", "Silero ONNX 不可用时自动使用能量 VAD 兜底。")
         self.audio_status = QLabel("尚未启动")
         self.audio_status.setObjectName("muted")
@@ -223,9 +454,30 @@ class MainWindow(QMainWindow):
         self.health_label = QLabel("健康  队列 0 · 丢包 0 · 重启 0")
         for label in (self.audio_status, self.level_label, self.prob_label, self.activity_label, self.health_label):
             live.box.addWidget(label)
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(-60, 0)
+        self.level_bar.setValue(-60)
+        self.level_bar.setFormat("%v dBFS")
+        self.level_bar.setToolTip("实时输入电平：对着麦克风说话时应明显跳动")
+        live.box.addWidget(self.level_bar)
+        self.audio_probe_btn = QPushButton("开始电平测试")
+        self.audio_probe_btn.setCheckable(True)
+        self.audio_probe_btn.setToolTip("不下载任何模型，先验证设备是否收到声音")
+        self.audio_probe_btn.toggled.connect(self.audio_probe)
+        live.box.addWidget(self.audio_probe_btn)
+        self.audio_hint = QLabel("")
+        self.audio_hint.setObjectName("muted")
+        self.audio_hint.setWordWrap(True)
+        self.audio_hint.setVisible(False)
+        live.box.addWidget(self.audio_hint)
         layout.addWidget(live)
         layout.addStretch()
         return page
+
+    def _sync_asr_model_pick(self) -> None:
+        value = self.asr_model_pick.currentData()
+        if value:
+            self.asr_model.setText(str(value))
 
     def _asr_page(self):
         page = QWidget()
@@ -241,6 +493,28 @@ class MainWindow(QMainWindow):
             browse.clicked.connect(picker)
             row.addWidget(browse)
             card.box.addLayout(row)
+        # One-click switch between the models that are already on disk: model
+        # size is the single biggest accuracy lever, and typing a full path is
+        # easy to get wrong.
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("已下载模型"))
+        self.asr_model_pick = QComboBox()
+        try:
+            from app.core import assets as _assets_mod
+            from app.core import paths as _paths_mod
+            for key in _assets_mod.status().installed_models:
+                spec = _assets_mod.model_spec(key)
+                if spec is not None:
+                    self.asr_model_pick.addItem(
+                        f"{spec.key}（{spec.note}）", str(_paths_mod.models_dir() / spec.filename)
+                    )
+        except Exception:
+            pass
+        if self.asr_model_pick.count() == 0:
+            self.asr_model_pick.addItem("未检测到已下载模型", "")
+        self.asr_model_pick.currentIndexChanged.connect(self._sync_asr_model_pick)
+        pick_row.addWidget(self.asr_model_pick, 1)
+        card.box.addLayout(pick_row)
         backend_row = QHBoxLayout()
         self.asr_backend_mode = QComboBox()
         self.asr_backend_mode.addItem("自动：优先常驻Server", "auto")
@@ -281,11 +555,45 @@ class MainWindow(QMainWindow):
         options.addWidget(self.asr_server_fallback)
         options.addStretch()
         card.box.addLayout(options)
+        latency_row = QHBoxLayout()
+        latency_row.addWidget(QLabel("断句延迟"))
+        self.asr_latency = QComboBox()
+        self.asr_latency.addItem("低延迟（更快出字，长句可能被提前切断）", {"min_silence_ms": 320, "max_seconds": 8})
+        self.asr_latency.addItem("均衡（默认）", {"min_silence_ms": 700, "max_seconds": 15})
+        self.asr_latency.addItem("高准确（等更久再断句）", {"min_silence_ms": 1100, "max_seconds": 20})
+        self.asr_latency.setToolTip("控制「说完多久才认定一句话结束」：越短字幕出得越快，越长越不容易把长句切断")
+        self.asr_latency.setCurrentIndex(1)
+        self.asr_latency.currentIndexChanged.connect(
+            lambda: self.asr_latency_changed.emit(self.asr_latency.currentData())
+        )
+        latency_row.addWidget(self.asr_latency, 1)
+        latency_row.addStretch()
+        card.box.addLayout(latency_row)
+        self.asr_draft = QCheckBox("实时草稿字幕（说话过程中先出部分字幕）")
+        self.asr_draft.setChecked(bool(getattr(self.settings, "asr_draft_enabled", False)))
+        self.asr_draft.setToolTip(
+            "每份草稿都是一次完整的 whisper 推理（CPU 上约 3 秒）。开着会更跟手，"
+            "但会把最终字幕排到后面 —— 追求低延迟时建议关闭"
+        )
+        self.asr_draft.toggled.connect(self.asr_draft_toggled)
+        card.box.addWidget(self.asr_draft)
+        quality_row = QHBoxLayout()
+        quality_row.addWidget(QLabel("解码质量"))
+        self.asr_beam = QComboBox()
+        self.asr_beam.addItem("最快（beam 1 · CPU 速度提升明显）", 1)
+        self.asr_beam.addItem("均衡（beam 2）", 2)
+        self.asr_beam.addItem("最准（beam 5 · 明显变慢）", 5)
+        beam_index = self.asr_beam.findData(int(getattr(self.settings, "asr_beam_size", 1)))
+        self.asr_beam.setCurrentIndex(max(0, beam_index))
+        self.asr_beam.setToolTip("束搜索宽度：越大越准但越慢。在 CPU 上这是除模型大小外最大的速度杠杆")
+        quality_row.addWidget(self.asr_beam, 1)
+        quality_row.addStretch()
+        card.box.addLayout(quality_row)
         apply_button = QPushButton("检测并应用识别后端")
         apply_button.setObjectName("primary")
         apply_button.clicked.connect(self._emit_asr_settings)
         card.box.addWidget(apply_button)
-        benchrow=QHBoxLayout();self.benchmark_path=QLineEdit();self.benchmark_path.setPlaceholderText("选择16-bit PCM WAV进行真实性能测试");pickbench=QPushButton("选择测试音频");pickbench.clicked.connect(self._pick_benchmark);runbench=QPushButton("运行基准");runbench.clicked.connect(lambda:self.asr_benchmark.emit(self.benchmark_path.text().strip()));benchrow.addWidget(self.benchmark_path,1);benchrow.addWidget(pickbench);benchrow.addWidget(runbench);card.box.addLayout(benchrow)
+        benchrow=QHBoxLayout();self.benchmark_path=QLineEdit();self.benchmark_path.setPlaceholderText("选择16-bit PCM WAV进行真实性能测试");pickbench=QPushButton("选择测试音频");pickbench.clicked.connect(self._pick_benchmark);runbench=QPushButton("运行基准");runbench.setToolTip("可选性能测试：选一段 WAV 测识别速度，与实时识别无关");runbench.clicked.connect(lambda:self.asr_benchmark.emit(self.benchmark_path.text().strip()));benchrow.addWidget(self.benchmark_path,1);benchrow.addWidget(pickbench);benchrow.addWidget(runbench);card.box.addLayout(benchrow)
         layout.addWidget(card)
         layout.addWidget(self._model_card())
         metrics = Card("识别状态")
@@ -368,9 +676,13 @@ class MainWindow(QMainWindow):
             self.model_status.setText(f"已下载：{'、'.join(installed)}")
         else:
             self.model_status.setText("未下载模型：请选择规格后点击「下载模型」")
-        self.set_capture_enabled(bool(data.get("ready")))
-        if not data.get("ready"):
-            self.model_progress_label.setText("模型未就绪，音频采集与识别功能已禁用")
+        ready = bool(data.get("ready"))
+        self.set_capture_enabled(ready)
+        start = getattr(self, "audio_start_button", None)
+        if start is not None:
+            start.setText("开始采集" if ready else "下载模型后开启语音")
+        if not ready:
+            self.model_progress_label.setText("模型未就绪：点击「下载模型后开启语音」会引导到本地识别页")
 
     def set_assets_detail(self, data):
         """Shows the per-component readiness of the three ASR assets.
@@ -394,15 +706,31 @@ class MainWindow(QMainWindow):
         self.model_status.setText(text)
 
     def set_capture_enabled(self, enabled: bool) -> None:
-        """Gate audio capture controls until the ASR assets are ready."""
+        """Gate audio capture controls until the ASR assets are ready.
+
+        The start button is kept clickable even when not ready: clicking it then
+        routes through ``audio_start`` which surfaces a clear "去下载模型" hint
+        instead of silently doing nothing.
+        """
         for widget in (
-            getattr(self, "audio_start_button", None),
             getattr(self, "audio_refresh_button", None),
             getattr(self, "audio_kind", None),
             getattr(self, "audio_device", None),
         ):
             if widget is not None:
                 widget.setEnabled(bool(enabled))
+        start = getattr(self, "audio_start_button", None)
+        if start is not None:
+            start.setEnabled(True)
+            start.setToolTip(
+                "开始实时语音识别与字幕" if enabled
+                else "ASR 模型未就绪：点击后请到「本地识别」页下载 GGML 模型"
+            )
+
+    def open_recognition_tab(self) -> None:
+        """Jump to the local-recognition tab (used when voice capture is blocked)."""
+        if getattr(self, "_asr_widget", None) is not None and getattr(self, "tabs", None) is not None:
+            self.tabs.setCurrentWidget(self._asr_widget)
 
     def set_download_progress(self, data):
         written = int(data.get("written") or 0)
@@ -418,6 +746,28 @@ class MainWindow(QMainWindow):
         if eta is not None:
             text += f" · 剩余 {int(eta)} 秒"
         self.model_progress_label.setText(text)
+
+    def _toggle_ds_key(self, checked: bool) -> None:
+        """Switches the API Key field between masked and readable."""
+        self.ds_key.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
+        self.ds_key_toggle.setText("隐藏" if checked else "显示")
+
+    def _ds_config(self) -> dict:
+        """Collects the DeepSeek panel into the payload the runtime applies."""
+        return {
+            "api_key": self.ds_key.text().strip(),
+            "base_url": self.ds_url.text().strip(),
+            "model": self.ds_model.currentText().strip(),
+            "timeout": self.ds_timeout.value(),
+            "retries": self.ds_retries.value(),
+        }
+
+    def set_deepseek_status(self, text: str) -> None:
+        """Shows the save/test result for the DeepSeek panel."""
+        if getattr(self, "ds_status", None) is not None:
+            self.ds_status.setText(text)
 
     def set_download_finished(self, ok: bool, message: str = "") -> None:
         self.model_progress.setVisible(ok)
@@ -450,6 +800,34 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("目标语言")); row.addWidget(self.translation_target)
         row.addWidget(QLabel("风格")); row.addWidget(self.translation_style)
         card.box.addLayout(row)
+
+        # Latency knobs: both trade a little quality for a shorter round-trip.
+        tuning = QHBoxLayout()
+        self.translation_max_tokens = QSpinBox()
+        self.translation_max_tokens.setRange(0, 4096)
+        self.translation_max_tokens.setSingleStep(32)
+        self.translation_max_tokens.setSpecialValueText("不限")
+        self.translation_max_tokens.setValue(int(getattr(self.settings, "translation_max_tokens", 0) or 0))
+        self.translation_max_tokens.setToolTip(
+            "生成上限 · 0/不限 = 用 Provider 默认值。生成长度是本地模型往返耗时的主项，"
+            "字幕行很短时填 64~128 能明显加快（Ollama→options.num_predict，OpenAI 兼容→max_tokens）"
+        )
+        self.translation_context_sentences = QSpinBox()
+        self.translation_context_sentences.setRange(0, 5)
+        self.translation_context_sentences.setValue(
+            int(getattr(self.settings, "translation_context_sentences", 2))
+        )
+        self.translation_context_sentences.setToolTip(
+            "上下文句数 · 携带的历史 Source/Translation 对数。调低=prompt 更短=本地推理更快，"
+            "代价是跨句连贯性下降。默认 2；追求连贯可上调到 3"
+        )
+        # Connected after the initial value is applied so startup does not look dirty.
+        self.translation_max_tokens.valueChanged.connect(self._mark_translation_dirty)
+        self.translation_context_sentences.valueChanged.connect(self._mark_translation_dirty)
+        tuning.addWidget(QLabel("生成上限")); tuning.addWidget(self.translation_max_tokens)
+        tuning.addWidget(QLabel("上下文句数")); tuning.addWidget(self.translation_context_sentences)
+        tuning.addStretch()
+        card.box.addLayout(tuning)
 
         self.provider_endpoints = dict(getattr(self.settings, "translation_endpoints", None) or {})
         base_line = QHBoxLayout()
@@ -489,6 +867,75 @@ class MainWindow(QMainWindow):
         chain_card.box.addLayout(list_row)
         self._reload_chain()
         layout.addWidget(chain_card)
+
+        ds = Card("DeepSeek 接入", "填写 API Key 即可使用；密钥经 Windows DPAPI 加密保存，不明文写入配置文件。")
+        key_row = QHBoxLayout()
+        self.ds_key = QLineEdit()
+        self.ds_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ds_key.setPlaceholderText("sk-xxxxxxxx（留空则沿用环境变量 DEEPSEEK_API_KEY）")
+        self.ds_key_toggle = QPushButton("显示")
+        self.ds_key_toggle.setCheckable(True)
+        self.ds_key_toggle.toggled.connect(self._toggle_ds_key)
+        key_row.addWidget(QLabel("API Key"))
+        key_row.addWidget(self.ds_key, 1)
+        key_row.addWidget(self.ds_key_toggle)
+        ds.box.addLayout(key_row)
+
+        url_row = QHBoxLayout()
+        self.ds_url = QLineEdit(DEEPSEEK_BASE_URL)
+        self.ds_url.setToolTip("DeepSeek 官方 OpenAI 兼容地址")
+        url_row.addWidget(QLabel("Base URL"))
+        url_row.addWidget(self.ds_url, 1)
+        ds.box.addLayout(url_row)
+
+        opt_row = QHBoxLayout()
+        self.ds_model = QComboBox()
+        self.ds_model.setEditable(True)
+        self.ds_model.setToolTip("可直接输入任意 DeepSeek 模型名，无需改代码")
+        for name in ("deepseek-flash", "deepseek-v4-pro", "deepseek-chat"):
+            self.ds_model.addItem(name)
+        self.ds_timeout = QDoubleSpinBox()
+        self.ds_timeout.setRange(5, 300)
+        self.ds_timeout.setValue(60)
+        self.ds_timeout.setSuffix(" s")
+        self.ds_retries = QSpinBox()
+        self.ds_retries.setRange(0, 5)
+        self.ds_retries.setValue(2)
+        opt_row.addWidget(QLabel("模型"))
+        opt_row.addWidget(self.ds_model, 1)
+        opt_row.addWidget(QLabel("超时"))
+        opt_row.addWidget(self.ds_timeout)
+        opt_row.addWidget(QLabel("重试"))
+        opt_row.addWidget(self.ds_retries)
+        ds.box.addLayout(opt_row)
+
+        saved = (getattr(self.settings, "translation_endpoints", None) or {}).get("deepseek") or {}
+        if saved.get("base_url"):
+            self.ds_url.setText(str(saved["base_url"]))
+        if saved.get("model"):
+            self.ds_model.setCurrentText(str(saved["model"]))
+        if saved.get("timeout"):
+            self.ds_timeout.setValue(float(saved["timeout"]))
+        if saved.get("retries"):
+            self.ds_retries.setValue(int(saved["retries"]))
+        if (getattr(self.settings, "api_key_secrets", None) or {}).get("deepseek"):
+            self.ds_key.setPlaceholderText("已保存加密密钥，留空表示继续使用")
+
+        btn_row = QHBoxLayout()
+        ds_save = QPushButton("保存并启用")
+        ds_save.setObjectName("primary")
+        ds_test = QPushButton("测试连接")
+        ds_save.clicked.connect(lambda: self.deepseek_apply.emit(self._ds_config()))
+        ds_test.clicked.connect(lambda: self.deepseek_test.emit(self._ds_config()))
+        btn_row.addWidget(ds_save)
+        btn_row.addWidget(ds_test)
+        btn_row.addStretch()
+        ds.box.addLayout(btn_row)
+        self.ds_status = QLabel("")
+        self.ds_status.setObjectName("muted")
+        self.ds_status.setWordWrap(True)
+        ds.box.addWidget(self.ds_status)
+        layout.addWidget(ds)
 
         actions = QHBoxLayout()
         self.translation_apply_button = QPushButton("应用翻译设置")
@@ -945,6 +1392,8 @@ class MainWindow(QMainWindow):
             "style": self.translation_style.currentData(),
             "endpoints": dict(self.provider_endpoints),
             "chain": self._current_chain(),
+            "max_tokens": self.translation_max_tokens.value(),
+            "context_sentences": self.translation_context_sentences.value(),
         })
 
     def _emit_translation_test(self):
@@ -1078,6 +1527,7 @@ class MainWindow(QMainWindow):
             "server_executable": self.asr_server.text().strip(),
             "server_port": self.asr_server_port.value(),
             "server_fallback": self.asr_server_fallback.isChecked(),
+            "beam_size": self.asr_beam.currentData(),
         }
         self.asr_apply.emit(payload)
 
@@ -1085,12 +1535,25 @@ class MainWindow(QMainWindow):
         current = self.audio_device.currentData()
         self.audio_device.clear()
         kind = self.audio_kind.currentData()
-        for device in devices:
-            if device.source_kind.value == kind:
-                self.audio_device.addItem(("★ " if device.is_default else "") + device.name, device.device_id)
+        matched = [d for d in devices if d.source_kind.value == kind]
+        # If the chosen source exposes nothing (typical case: no WASAPI loopback
+        # device exists on this machine) fall back to every input device, so the
+        # list is never empty and unusable.
+        source = matched or list(devices)
+        virtual_tokens = ("Voicemeeter", "VB-Audio", "CABLE", "Virtual", "虚拟")
+        for device in source:
+            label = device.name
+            # Virtual mixers are selectable but usually carry no signal unless
+            # something is explicitly routed into them -- flag them so they are
+            # not mistaken for a real microphone.
+            if any(token in label for token in virtual_tokens):
+                label += "（虚拟设备）"
+            self.audio_device.addItem(("★ " if device.is_default else "") + label, device.device_id)
         index = self.audio_device.findData(current)
         if index >= 0:
             self.audio_device.setCurrentIndex(index)
+        if not matched and devices:
+            self.set_audio_status("未检测到该来源的设备，已列出全部输入设备")
 
     def set_audio_status(self, text):
         self.audio_status.setText(text)
@@ -1098,6 +1561,37 @@ class MainWindow(QMainWindow):
 
     def set_audio_level(self, value):
         self.level_label.setText(f"音量  {value:.1f} dBFS")
+        bar = getattr(self, "level_bar", None)
+        if bar is not None:
+            bar.setValue(int(max(bar.minimum(), min(bar.maximum(), value))))
+        self._track_quiet_input(value)
+
+    def _track_quiet_input(self, value: float) -> None:
+        """Warns when a running capture receives essentially no signal.
+
+        Choosing a virtual or unused device (Voicemeeter Out *, an idle loopback)
+        looks exactly like a healthy setup: capture says "running", yet no speech
+        segment is ever produced and nothing is recognised. Without this hint the
+        user has no way to tell the device is simply silent.
+        """
+        hint = getattr(self, "audio_hint", None)
+        if hint is None:
+            return
+        quiet_floor = -45.0
+        quiet_ticks_needed = 120  # roughly 2-4 s of consecutive silent frames
+        if value < quiet_floor:
+            self._quiet_ticks = getattr(self, "_quiet_ticks", 0) + 1
+        else:
+            self._quiet_ticks = 0
+        if self._quiet_ticks > quiet_ticks_needed:
+            hint.setText(
+                "当前设备几乎没有声音输入，因此不会产生识别结果。请换一个有信号的设备："
+                "翻译视频/游戏声 → 来源选「系统声音」，设备选带 [Loopback] 的那个；"
+                "翻译自己说话 → 来源选「麦克风」，设备选真实麦克风（勿用 Voicemeeter 虚拟通道）。"
+            )
+            hint.setVisible(True)
+        elif self._quiet_ticks == 0:
+            hint.setVisible(False)
 
     def set_vad_probability(self, value):
         self.prob_label.setText(f"人声概率  {value * 100:.0f}%")
@@ -1165,10 +1659,12 @@ class MainWindow(QMainWindow):
         self.latency_chart.set_colors(tokens["accent"], tokens["warn"])
         self.status_pill.setStyleSheet(
             f"background:{tokens['card']};color:{tokens['accent']};"
-            "padding:8px 13px;border-radius:12px;font-weight:700"
+            f"border:1px solid {tokens['card_border']};"
+            "padding:8px 14px;border-radius:13px;font-weight:700"
         )
 
     def sync(self):
+        self._sync_subtitle_size()
         self.lock_btn.setText("解除锁定" if self.overlay.locked else "锁定位置")
         self.through_btn.setText("关闭穿透" if self.overlay.through else "开启穿透")
         self.set_visibility_state(self.overlay.isVisible())

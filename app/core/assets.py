@@ -65,9 +65,13 @@ def model_url(key: str, source: str = "huggingface") -> str:
 
 # whisper.cpp 官方预编译 Windows 二进制（含 whisper-cli.exe / whisper-server.exe）
 # 版本固定，与模型规格解耦，便于后续按版本绑定
-WHISPER_CPP_VERSION = "v1.7.5"
+# NOTE: not every tag ships Windows binaries. v1.7.5 for example only published a
+# macOS xcframework, so its whisper-bin-x64.zip 404s. v1.9.2 is the newest release
+# whose asset list actually contains whisper-bin-x64.zip (with whisper-cli.exe and
+# whisper-server.exe inside).
+WHISPER_CPP_VERSION = "v1.9.2"
 WHISPER_CPP_ZIP_URL = (
-    "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.5/whisper-bin-x64.zip"
+    "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.2/whisper-bin-x64.zip"
 )
 
 # Silero VAD 官方 ONNX 模型（约 2MB，由 onnxruntime 推理，避免引入 torch）

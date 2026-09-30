@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
+
+from app.core import assets, paths
 
 from app.asr.benchmark import benchmark_wav, save_benchmark
 from app.asr.filters import HallucinationFilter
@@ -16,6 +19,8 @@ from app.asr.whisper_server import (
 )
 from app.streaming.language_manager import LanguageManager
 from app.streaming.stabilizer import TranscriptStabilizer
+
+logger = logging.getLogger(__name__)
 
 
 class ASRService(QObject):
@@ -55,16 +60,26 @@ class ASRService(QObject):
         server_executable: str = "",
         server_port: int = 8178,
         server_fallback: bool = True,
+        beam_size: int = 1,
     ) -> None:
         asyncio.create_task(self._configure_async(
             executable, model, language, use_gpu, cpu_fallback,
-            backend_mode, server_executable, server_port, server_fallback,
+            backend_mode, server_executable, server_port, server_fallback, beam_size,
         ))
 
-    async def _configure_async(self, executable, model, language, use_gpu, cpu_fallback, backend_mode, server_executable, server_port, server_fallback) -> None:
+    async def _configure_async(self, executable, model, language, use_gpu, cpu_fallback, backend_mode, server_executable, server_port, server_fallback, beam_size: int = 1) -> None:
         await self._close_backend()
         cli_exe = Path(executable).expanduser() if executable else WhisperCppProvider.discover(self.project_root)
         model_path = Path(model).expanduser() if model else self._discover_model()
+        status = assets.status()
+        if cli_exe is None or not cli_exe.is_file():
+            # assets.status() scans the data tools dir recursively, so it keeps
+            # ASR alive even if the archive layout drifts again.
+            cli_exe = Path(status.whisper_cli) if status.whisper_cli else cli_exe
+        if model_path is None or not model_path.is_file():
+            discovered_models = sorted(paths.models_dir().glob("*.bin"))
+            if discovered_models:
+                model_path = discovered_models[0]
         probe = WhisperCppProvider.probe(cli_exe, model_path)
         self.language_manager.configure(language)
         self.stabilizer.reset()
@@ -74,13 +89,15 @@ class ASRService(QObject):
         self.backend_mode = backend_mode if backend_mode in {"auto", "server", "cli"} else "auto"
         self.cli_provider = None
         if probe.available:
-            self._cli_config = WhisperCppConfig(cli_exe, model_path, language=language, use_gpu=use_gpu)
+            self._cli_config = WhisperCppConfig(cli_exe, model_path, language=language, use_gpu=use_gpu, final_beam_size=beam_size)
             self.cli_provider = WhisperCppProvider(self._cli_config)
 
         server_exe = Path(server_executable).expanduser() if server_executable else WhisperServerProcess.discover(self.project_root)
+        if server_exe is None or not server_exe.is_file():
+            server_exe = Path(status.whisper_server) if status.whisper_server else server_exe
         wants_server = self.backend_mode in {"auto", "server"}
         if wants_server and server_exe and model_path and model_path.is_file():
-            config = WhisperServerConfig(server_exe, model_path, port=int(server_port), language=language, use_gpu=use_gpu)
+            config = WhisperServerConfig(server_exe, model_path, port=int(server_port), language=language, use_gpu=use_gpu, beam_size=beam_size)
             process = WhisperServerProcess(config)
             server = WhisperServerProvider(process)
             try:
@@ -136,6 +153,18 @@ class ASRService(QObject):
             return
         except Exception as exc:
             self.error.emit(str(exc)); return
+        # Accurate per-call recognition timing: inference time (provider), how long
+        # it waited for the worker, the audio length and the realtime factor.
+        try:
+            duration = max(0.001, (result.end_ms - result.start_ms) / 1000.0)
+            logger.info(
+                "[识别] 计算 %.0f ms · 音频 %.1fs · 实时率 %.2f · 排队 %.0f ms · %s",
+                provider.last_latency_ms, duration, provider.last_realtime_factor,
+                self.worker.last_queue_wait_ms if self.worker else 0,
+                (result.text or "")[:40],
+            )
+        except Exception:
+            pass
         decision = self.hallucination_filter.evaluate(result.text, result.confidence, result.no_speech_probability)
         if not decision.accepted:
             self.metrics_changed.emit({
@@ -197,8 +226,18 @@ class ASRService(QObject):
     def run_benchmark(self, path: str) -> None:
         provider = self.cli_provider or self.provider
         if not provider or provider.provider_id != "whisper_cpp":
-            self.error.emit("基准测试目前需要CLI后端"); return
-        task = asyncio.create_task(self._benchmark(provider, Path(path)))
+            self.error.emit("基准测试目前需要 CLI 后端（whisper-cli）")
+            return
+        # Validate first: an empty path used to reach wave.open() and surface a
+        # cryptic "[Errno 13] Permission denied" in the recognition status.
+        candidate = Path(path).expanduser() if path and path.strip() else None
+        if candidate is None or not candidate.is_file():
+            self.error.emit("请先点「选择测试音频」选一个 16-bit PCM 的 WAV 文件，再点运行基准")
+            return
+        if candidate.suffix.lower() != ".wav":
+            self.error.emit("基准测试只支持 .wav（16-bit PCM）文件")
+            return
+        task = asyncio.create_task(self._benchmark(provider, candidate))
         self.delivery_tasks.add(task); task.add_done_callback(self.delivery_tasks.discard)
 
     async def _benchmark(self, provider, path: Path) -> None:

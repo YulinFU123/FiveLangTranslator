@@ -30,7 +30,7 @@ class OverlayAppearance:
     # Spec config keys ------------------------------------------------------
     subtitle_font_family: str = "Microsoft YaHei UI"
     subtitle_font_weight: int = 400
-    subtitle_font_size: int = 16
+    subtitle_font_size: int = 14
     subtitle_original_color: str = "#cbd5e1"
     subtitle_translation_color: str = "#ffffff"
     subtitle_bg_color: str = "rgba(8,12,20,0)"
@@ -128,7 +128,7 @@ PRESETS: dict[str, dict[str, Any]] = {
     CINEMA_PRESET: {
         "subtitle_font_family": "Microsoft YaHei UI",
         "subtitle_font_weight": 400,
-        "subtitle_font_size": 16,
+        "subtitle_font_size": 14,
         "subtitle_original_color": "#cbd5e1",
         "subtitle_translation_color": "#ffffff",
         "subtitle_bg_color": "rgba(8,12,20,0)",
@@ -137,7 +137,7 @@ PRESETS: dict[str, dict[str, Any]] = {
     MEETING_PRESET: {
         "subtitle_font_family": "Microsoft YaHei UI",
         "subtitle_font_weight": 400,
-        "subtitle_font_size": 18,
+        "subtitle_font_size": 16,
         "subtitle_original_color": "#dbeafe",
         "subtitle_translation_color": "#f8fafc",
         "subtitle_bg_color": "rgba(15,23,42,0)",
@@ -146,7 +146,7 @@ PRESETS: dict[str, dict[str, Any]] = {
     READING_PRESET: {
         "subtitle_font_family": "Microsoft YaHei UI",
         "subtitle_font_weight": 400,
-        "subtitle_font_size": 20,
+        "subtitle_font_size": 18,
         "subtitle_original_color": "#a5b4fc",
         "subtitle_translation_color": "#e2e8f0",
         "subtitle_bg_color": "rgba(8,12,20,0)",

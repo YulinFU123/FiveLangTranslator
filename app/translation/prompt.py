@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.translation.context import DEFAULT_CONTEXT_SENTENCES
+
 DEFAULT_MAX_LINES = 2
 LINE_BUDGET_MINIMUM = 1
 LINE_BUDGET_MAXIMUM = 8
@@ -44,7 +46,9 @@ def build_messages(job) -> list[dict[str, str]]:
         "complete": "Translate completely and naturally without omitting information.",
     }.get(job.style, job.style)
     glossary = "\n".join(f"{key} => {value}" for key, value in job.glossary.items())
-    context = "\n".join(job.context[-3:])
+    # Trimmed again here so the prompt never exceeds the configured window even
+    # if a caller hands over a longer history.
+    context = "\n".join(job.context[-DEFAULT_CONTEXT_SENTENCES:])
     line_budget = line_budget_clause(getattr(job, "max_lines", DEFAULT_MAX_LINES))
     system = (
         f"You are a professional subtitle translator. Translate from {source} to {target}. "

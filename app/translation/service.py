@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal
 
 from app.core.models import RecognitionResult, SubtitleStatus, TranslationResult
 from app.translation.cache import TranslationCache
-from app.translation.context import TranslationContext
+from app.translation.context import DEFAULT_CONTEXT_SENTENCES, TranslationContext
 from app.translation.models import TranslationJob
 from app.translation.prompt import DEFAULT_MAX_LINES, clamp_line_budget
 from app.translation.errors import TranslationProviderError
@@ -20,7 +20,7 @@ class TranslationService(QObject):
     metrics_changed = Signal(object)
     error = Signal(str)
 
-    def __init__(self, cache=None) -> None:
+    def __init__(self, cache=None, context_sentences: int = DEFAULT_CONTEXT_SENTENCES) -> None:
         super().__init__()
         # Ordered fallback chain: chain[0] is the primary provider.
         self.chain: list = []
@@ -33,7 +33,10 @@ class TranslationService(QObject):
         # round-trips cheap while shaving ~120ms off perceived translation lag.
         self.draft_debounce_ms = 160
         self.cache = cache or TranslationCache()
-        self.context = TranslationContext(3)
+        # How many previous pairs ride along in the prompt. Fewer tokens = faster
+        # local inference, trading away a little cross-sentence coherence.
+        self.context_sentences = max(0, int(context_sentences))
+        self.context = TranslationContext(self.context_sentences)
         self.glossary: dict[str, str] = {}
         self.max_lines = DEFAULT_MAX_LINES
         self.stats = LatencyTracker(50)
@@ -45,6 +48,14 @@ class TranslationService(QObject):
         self.inflight_dedup_enabled: bool = True
         self.latest_revision: dict[str, int] = {}
         self.enabled = False
+
+    def set_context_sentences(self, count: int) -> None:
+        """Rebuilds the prompt context window with a different sentence budget."""
+        count = max(0, int(count))
+        if count == self.context_sentences:
+            return
+        self.context_sentences = count
+        self.context = TranslationContext(count)
 
     def set_providers(self, providers) -> None:
         """Installs the ordered fallback chain built by TranslationProviderRegistry."""

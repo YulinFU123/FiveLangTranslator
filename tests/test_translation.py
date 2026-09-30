@@ -1,6 +1,6 @@
 from app.core.models import SubtitleStatus
 from app.translation.cache import TranslationCache
-from app.translation.context import TranslationContext
+from app.translation.context import DEFAULT_CONTEXT_SENTENCES, TranslationContext
 from app.translation.models import TranslationJob
 from app.translation.prompt import build_messages, clamp_line_budget, clean_translation
 
@@ -32,10 +32,44 @@ def test_cache_key_changes_with_model():
     assert cache.key(job, "ollama", "a") != cache.key(job, "ollama", "b")
 
 
-def test_cache_key_changes_with_line_budget():
+def test_cache_key_is_stable_across_line_budget():
+    """Resizing the box must not invalidate stored translations.
+
+    The line budget is only a soft wording hint, so keeping max_lines out of the
+    key lets an already translated sentence survive a box resize instead of
+    forcing a fresh (and visibly slow) provider round-trip.
+    """
     cache = TranslationCache()
-    assert cache.key(make_job(max_lines=2), "ollama", "m") != cache.key(make_job(max_lines=4), "ollama", "m")
-    assert cache.key(make_job(max_lines=4), "ollama", "m") != cache.key(make_job(max_lines=5), "ollama", "m")
+    base = cache.key(make_job(max_lines=2), "ollama", "m")
+    assert base == cache.key(make_job(max_lines=4), "ollama", "m")
+    assert base == cache.key(make_job(max_lines=5), "ollama", "m")
+    # Genuinely different text must still get its own entry.
+    assert base != cache.key(make_job(text="Something else"), "ollama", "m")
+
+
+def test_context_window_defaults_to_two_and_is_configurable():
+    assert DEFAULT_CONTEXT_SENTENCES == 2
+    assert TranslationContext().sentences.maxlen == 2
+    assert TranslationContext(5).sentences.maxlen == 5
+
+
+def test_prompt_context_is_trimmed_to_window():
+    job = make_job()
+    job.context = [f"Source: s{index}" for index in range(6)]
+    user_content = build_messages(job)[1]["content"]
+    # Only the newest pairs may reach the prompt (s4/s5 -> trimmed to 2).
+    assert "s5" in user_content and "s4" in user_content
+    assert "s3" not in user_content
+
+
+def test_registry_threads_max_tokens_into_provider_configs():
+    from app.translation.registry import TranslationProviderRegistry
+
+    registry = TranslationProviderRegistry()
+    assert registry.create("ollama", options={"max_tokens": 64}).config.max_tokens == 64
+    assert registry.create("openai_compatible", options={"max_tokens": 96}).config.max_tokens == 96
+    # Default stays unbounded so behaviour is unchanged when unset.
+    assert registry.create("ollama", options={}).config.max_tokens == 0
 
 
 def test_prompt_injects_line_budget():

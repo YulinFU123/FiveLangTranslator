@@ -36,6 +36,9 @@ class ProviderPreset:
     api_key_environment: str = ""
     requires_endpoint_id: bool = False
     note: str = ""
+    # Suggested models shown in the UI combo; the field stays freely editable so
+    # new DeepSeek models need no code change.
+    model_options: tuple[str, ...] = ()
 
     def effective_base_url(self, base_url: str = "") -> str:
         return (base_url or self.base_url).strip().rstrip("/") or self.base_url
@@ -75,10 +78,11 @@ PRESETS: dict[str, ProviderPreset] = {
     ),
     "deepseek": ProviderPreset(
         "deepseek", "openai_compatible", "DeepSeek",
-        DEEPSEEK_BASE_URL, "deepseek-chat",
-        model_label="模型", model_placeholder="deepseek-chat",
+        DEEPSEEK_BASE_URL, "deepseek-flash",
+        model_label="模型", model_placeholder="deepseek-flash",
         requires_api_key=True, api_key_environment="DEEPSEEK_API_KEY",
-        note="复用 OpenAI Compatible 适配层，密钥来自 DEEPSEEK_API_KEY",
+        model_options=("deepseek-flash", "deepseek-v4-pro", "deepseek-chat"),
+        note="复用 OpenAI 兼容接口；API Key 在面板填写后经 Windows DPAPI 加密保存",
     ),
     "doubao": ProviderPreset(
         "doubao", "openai_compatible", "豆包（火山方舟 Ark）",
@@ -125,6 +129,7 @@ class TranslationProviderRegistry:
                 timeout=float(settings.get("timeout", 60.0)),
                 keep_alive=str(settings.get("keep_alive", "15m")),
                 temperature=float(settings.get("temperature", 0.2)),
+                max_tokens=int(settings.get("max_tokens", 0) or 0),
             ))
         elif preset.driver == "openai_compatible":
             provider = OpenAICompatibleTranslationProvider(OpenAICompatibleConfig(
@@ -132,6 +137,10 @@ class TranslationProviderRegistry:
                 api_key_environment=str(settings.get("api_key_environment", preset.api_key_environment)),
                 timeout=float(settings.get("timeout", 60.0)),
                 temperature=float(settings.get("temperature", 0.2)),
+                # Decrypted by the caller; preferred over the environment variable.
+                api_key=str(settings.get("api_key", "") or ""),
+                retries=int(settings.get("retries", 2)),
+                max_tokens=int(settings.get("max_tokens", 0) or 0),
             ))
         else:  # pragma: no cover - guards against a typo in future presets
             raise ValueError(f"未支持的 Provider 驱动：{preset.driver}")
@@ -200,5 +209,8 @@ def plan_from_settings(settings) -> list[dict]:
         if legacy:
             base_url = base_url or str(getattr(settings, legacy[0], "") or "")
             model = model or str(getattr(settings, legacy[1], "") or "")
-        plan.append({"provider_id": provider_id, "base_url": base_url, "model": model})
+        # Global tuning knobs travel per entry so every link in the chain honours
+        # them. 0 keeps each provider's own default behaviour.
+        options = {"max_tokens": int(getattr(settings, "translation_max_tokens", 0) or 0)}
+        plan.append({"provider_id": provider_id, "base_url": base_url, "model": model, "options": options})
     return plan

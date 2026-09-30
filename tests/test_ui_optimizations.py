@@ -91,9 +91,9 @@ def test_closing_collapses_into_the_tray(window):
 
 def test_theme_mode_updates_ad_hoc_widgets(window):
     window.apply_theme_mode(True)
-    assert window.latency_chart.colour.name() == "#059669"
+    assert window.latency_chart.colour.name() == "#248a3d"
     window.apply_theme_mode(False)
-    assert window.latency_chart.colour.name() == "#6ee7b7"
+    assert window.latency_chart.colour.name() == "#30d158"
 
 
 def test_settings_widgets_carry_tooltips(window):

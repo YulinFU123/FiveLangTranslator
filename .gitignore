@@ -17,3 +17,13 @@ tests/latency_reports/
 build/
 dist/
 *.egg-info/
+
+# 本机数据与隐私（切勿入库：含 API 密钥与历史记录）
+settings.json
+*.db
+*.sqlite
+*.sqlite3
+
+# 测试缓存与发布压缩包
+.pytest_cache/
+*.zip

@@ -55,17 +55,33 @@ class WhisperCppProvider:
         env = os.environ.get("WHISPER_CPP_PATH")
         if env:
             candidates.append(Path(env))
+        tools = None
         if root:
+            tools = root / "tools" / "whisper.cpp"
             candidates.extend([
-                root / "tools" / "whisper.cpp" / "whisper-cli.exe",
-                root / "tools" / "whisper.cpp" / "whisper-cli",
-                root / "tools" / "whisper.cpp" / "build" / "bin" / "Release" / "whisper-cli.exe",
-                root / "tools" / "whisper.cpp" / "build" / "bin" / "whisper-cli.exe",
+                # Prefer a locally built Vulkan (GPU) build when present: it is
+                # several times faster than the stock CPU-only distribution.
+                tools / "Vulkan" / "whisper-cli.exe",
+                tools / "whisper-cli.exe",
+                tools / "whisper-cli",
+                # The official whisper-bin-x64.zip unpacks straight into
+                # <tools>/Release/ instead of <tools>/build/bin/Release/.
+                tools / "Release" / "whisper-cli.exe",
+                tools / "build" / "bin" / "Release" / "whisper-cli.exe",
+                tools / "build" / "bin" / "whisper-cli.exe",
             ])
         found = shutil.which("whisper-cli") or shutil.which("whisper-cli.exe")
         if found:
             candidates.append(Path(found))
-        return next((path for path in candidates if path.is_file()), None)
+        for path in candidates:
+            if path.is_file():
+                return path
+        # Recursive fallback so a future archive layout cannot silently disable ASR.
+        if tools and tools.is_dir():
+            for path in sorted(tools.rglob("whisper-cli.exe")):
+                if path.is_file():
+                    return path
+        return None
 
     @classmethod
     def probe(cls, executable: Path | None, model: Path | None) -> BackendProbe:
@@ -131,11 +147,16 @@ class WhisperCppProvider:
             ]
             if not self.config.use_gpu:
                 command.append("-ng")
+            env = os.environ.copy()
+            # Steer the Vulkan backend at the discrete GPU (device 0), otherwise
+            # it can pick the integrated graphics and leave the fast card idle.
+            env.setdefault("GGML_VULKAN_DEVICE", "0")
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=_no_window_flag(),
+                env=env,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(

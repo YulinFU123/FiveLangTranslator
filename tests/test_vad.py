@@ -44,9 +44,25 @@ def test_silero_feeds_expected_inputs():
 
     feeds = session.feeds[0]
     assert set(feeds) == {"input", "state", "sr"}
-    assert feeds["input"].shape == (1, vad.SILERO_WINDOW)
+    # Silero needs 64 samples of context + the 512 new samples = 576. Feeding
+    # only 512 made the model output ~0 for every input (no speech ever seen).
+    assert feeds["input"].shape == (1, vad.SILERO_WINDOW + vad.SILERO_CONTEXT)
     assert feeds["input"].dtype == np.float32
     assert int(np.asarray(feeds["sr"]).reshape(-1)[0]) == 16000
+
+
+def test_silero_carries_context_between_frames():
+    engine = vad.SileroVADEngine()
+    session = FakeSession()
+    engine.session = session
+
+    engine.process(_window(0.0), -20.0)
+    engine.process(_window(1.0), -20.0)
+
+    second = session.feeds[1]["input"].reshape(-1)
+    assert second.shape[0] == vad.SILERO_WINDOW + vad.SILERO_CONTEXT
+    assert np.all(second[: vad.SILERO_CONTEXT] == 0.0)
+    assert np.all(second[vad.SILERO_CONTEXT:] == 1.0)
 
 
 def test_silero_rejects_wrong_window_size():

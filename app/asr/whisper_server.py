@@ -31,6 +31,9 @@ class WhisperServerConfig:
     use_gpu: bool = True
     startup_timeout: float = 60.0
     request_timeout: float = 90.0
+    # Beam width for the server's own decoding. CPU inference is dominated by
+    # beam search, so a small beam is the single biggest speed lever here.
+    beam_size: int = 1
 
     @property
     def base_url(self) -> str:
@@ -51,16 +54,31 @@ class WhisperServerProcess:
         env = os.environ.get("WHISPER_SERVER_PATH")
         if env:
             candidates.append(Path(env))
+        tools = None
         if root:
+            tools = root / "tools" / "whisper.cpp"
             candidates.extend([
-                root / "tools" / "whisper.cpp" / "whisper-server.exe",
-                root / "tools" / "whisper.cpp" / "whisper-server",
-                root / "tools" / "whisper.cpp" / "build" / "bin" / "Release" / "whisper-server.exe",
+                # Prefer a locally built Vulkan (GPU) build when present.
+                tools / "Vulkan" / "whisper-server.exe",
+                tools / "whisper-server.exe",
+                tools / "whisper-server",
+                # The official whisper-bin-x64.zip unpacks straight into
+                # <tools>/Release/ instead of <tools>/build/bin/Release/.
+                tools / "Release" / "whisper-server.exe",
+                tools / "build" / "bin" / "Release" / "whisper-server.exe",
             ])
         found = shutil.which("whisper-server") or shutil.which("whisper-server.exe")
         if found:
             candidates.append(Path(found))
-        return next((path for path in candidates if path.is_file()), None)
+        for path in candidates:
+            if path.is_file():
+                return path
+        # Recursive fallback so a future archive layout cannot silently disable ASR.
+        if tools and tools.is_dir():
+            for path in sorted(tools.rglob("whisper-server.exe")):
+                if path.is_file():
+                    return path
+        return None
 
     async def start(self) -> None:
         if self.is_running:
@@ -73,6 +91,8 @@ class WhisperServerProcess:
             str(self.config.executable), "-m", str(self.config.model),
             "--host", self.config.host, "--port", str(self.config.port),
             "-t", str(max(1, self.config.threads)),
+            "-bs", str(max(1, self.config.beam_size)),
+            "-bo", str(max(1, self.config.beam_size)),
         ]
         if not self.config.use_gpu:
             command.append("-ng")
@@ -81,6 +101,7 @@ class WhisperServerProcess:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             creationflags=_no_window_flag(),
+            env=_gpu_env(),
         )
         self.stdout_task = asyncio.create_task(self._collect_output())
         deadline = monotonic() + self.config.startup_timeout
@@ -184,6 +205,17 @@ class WhisperServerProvider:
             metadata.get("no_speech_probability"),
             metadata,
         )
+
+
+def _gpu_env() -> dict:
+    """Pick the discrete GPU for the Vulkan backend.
+
+    Without this ggml may latch onto the CPU's integrated graphics (which shows
+    up as "AMD Radeon(TM) Graphics") and leave a much faster card idle.
+    """
+    env = os.environ.copy()
+    env.setdefault("GGML_VULKAN_DEVICE", "0")
+    return env
 
 
 def _port_open(host: str, port: int) -> bool:

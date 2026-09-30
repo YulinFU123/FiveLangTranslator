@@ -18,16 +18,18 @@ logger = logging.getLogger(__name__)
 _COLOR_KEYS = ("subtitle_original_color", "subtitle_translation_color", "subtitle_bg_color")
 
 # Default palettes applied when following the Windows light/dark theme.
+# The subtitle box background is intentionally transparent so the overlay reads
+# as floating text; a faint drag border is drawn on hover by the overlay window.
 _THEME_DEFAULTS = {
     True: {  # light
         "subtitle_original_color": "#1f2937",
         "subtitle_translation_color": "#0f172a",
-        "subtitle_bg_color": "rgba(255,255,255,0.80)",
+        "subtitle_bg_color": "rgba(255,255,255,0)",
     },
     False: {  # dark
         "subtitle_original_color": "#cbd5e1",
         "subtitle_translation_color": "#ffffff",
-        "subtitle_bg_color": "rgba(8,12,20,0.76)",
+        "subtitle_bg_color": "rgba(8,12,20,0)",
     },
 }
 

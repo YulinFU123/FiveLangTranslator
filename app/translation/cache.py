@@ -5,10 +5,12 @@ from hashlib import sha256
 import json
 from time import monotonic
 
-from app.translation.prompt import DEFAULT_MAX_LINES
-
 # Cache keys cover every setting that can change a translation.
-CACHE_KEY_FIELDS = ("text", "source", "target", "style", "glossary", "provider", "model", "max_lines")
+# Note: the visible line budget (max_lines) is deliberately NOT part of the key.
+# It only feeds a soft "keep it within N lines" instruction, so sharing one entry
+# across box sizes avoids re-translating the same sentence after every resize
+# (a visible slowdown whenever embeds the perspective changes).
+CACHE_KEY_FIELDS = ("text", "source", "target", "style", "glossary", "provider", "model")
 
 # L1 keeps a short TTL (seconds scale) so a stale in process copy never outlives
 # the durable L2 entry for long. L2 is consulted whenever L1 misses or expires.
@@ -24,8 +26,6 @@ def build_key(job, provider_id: str, model: str) -> str:
         "glossary": job.glossary,
         "provider": provider_id,
         "model": model,
-        # The visible line count changes the wording, so it must not share entries.
-        "max_lines": int(getattr(job, "max_lines", DEFAULT_MAX_LINES) or 0),
     }
     return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 

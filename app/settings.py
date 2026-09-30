@@ -11,8 +11,8 @@ from app.core import paths
 class Profile:
     x: float = .12
     y: float = .76
-    w: float = .76
-    h: float = .16
+    w: float = .5
+    h: float = .1
     screen_name: str = ""
 
 
@@ -36,10 +36,24 @@ class Settings:
     asr_language: str = "auto"
     asr_use_gpu: bool = True
     asr_cpu_fallback: bool = True
+    # Decoding beam width. 1 = greedy (fastest, slightly less accurate),
+    # 5 = most accurate but several times slower on CPU.
+    asr_beam_size: int = 1
+    # Draft subtitles while someone is still speaking. whisper pads every call
+    # to a 30 s window, so each draft costs roughly the same ~3 s as a final
+    # one; on CPU they pile up and delay the real subtitle. Off by default.
+    asr_draft_enabled: bool = False
     translation_provider: str = "ollama"
     translation_fallback_provider: str = "openai_compatible"
     translation_target_language: str = "zh"
     translation_style: str = "cinema"
+    # Cap on generated tokens per request. 0 = provider default (unbounded).
+    # Generation dominates a local round-trip, so a tight cap is the cheapest
+    # latency win (Ollama: options.num_predict; OpenAI compatible: max_tokens).
+    translation_max_tokens: int = 0
+    # Previous Source/Translation pairs carried in the prompt. Fewer tokens =
+    # faster local inference, at a small cost to cross-sentence coherence.
+    translation_context_sentences: int = 2
     overlay_layout_mode: str = "stacked"
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3:4b"
@@ -49,6 +63,8 @@ class Settings:
     translation_chain: list[str] = field(default_factory=lambda: ["ollama", "openai_compatible"])
     # Per provider endpoint overrides: {"deepseek": {"base_url": "...", "model": "..."}}
     translation_endpoints: dict[str, dict] = field(default_factory=dict)
+    # DPAPI-encrypted API keys: {"deepseek": "<base64 ciphertext>"}. Never plaintext.
+    api_key_secrets: dict[str, str] = field(default_factory=dict)
     auto_record_sessions: bool = True
     export_format: str = "srt"
     export_content: str = "bilingual"
@@ -63,7 +79,7 @@ class Settings:
     def __post_init__(self) -> None:
         legacy = self.profile or Profile()
         self.windowed_profile = self.windowed_profile or legacy
-        self.fullscreen_profile = self.fullscreen_profile or Profile(.08, .79, .84, .14)
+        self.fullscreen_profile = self.fullscreen_profile or Profile(.08, .80, .6, .1)
         self.profile = self.windowed_profile
 
 

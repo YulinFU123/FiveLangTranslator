@@ -1,6 +1,9 @@
-"""Generate resources/icon.ico without third-party dependencies.
+"""Generate resources/icon.ico.
 
-Design: rounded blue tile with two white bars (subtitle lines).
+Preferred source is ``resources/logo.png`` (the square brand logo), which is
+scaled smoothly into every icon size. If that file is missing the original
+dependency-free procedural design (rounded blue tile with two white subtitle
+bars) is used as a fallback, so the build never breaks.
 """
 from __future__ import annotations
 
@@ -8,6 +11,8 @@ import struct
 from pathlib import Path
 
 SIZES = (16, 32, 48, 64, 256)
+
+# -- fallback (procedural) design: rounded blue tile with two white bars --------
 BG = (37, 99, 235)      # RGB
 FG = (255, 255, 255)    # RGB
 RADIUS_RATIO = 0.22
@@ -46,6 +51,35 @@ def render(size: int) -> list[list[tuple[int, int, int, int]]]:
     return rows
 
 
+def render_from_logo(logo_path: Path, size: int):
+    """Smoothly scales the brand logo down to one icon size.
+
+    Returns ``None`` when Qt (or the logo) is unavailable so the caller can fall
+    back to the procedural design instead of failing the whole build.
+    """
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage
+    except Exception:  # pragma: no cover - PySide6 always present in this project
+        return None
+    image = QImage(str(logo_path))
+    if image.isNull():
+        return None
+    image = image.convertToFormat(QImage.Format.Format_ARGB32).scaled(
+        size, size,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    rows: list[list[tuple[int, int, int, int]]] = []
+    for y in range(image.height()):
+        row: list[tuple[int, int, int, int]] = []
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            row.append((color.red(), color.green(), color.blue(), color.alpha()))
+        rows.append(row)
+    return rows
+
+
 def _image_chunk(size: int, rows) -> bytes:
     # BITMAPINFOHEADER: height doubles because the AND mask follows the pixels
     header = struct.pack("<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
@@ -57,8 +91,13 @@ def _image_chunk(size: int, rows) -> bytes:
     return header + bytes(pixels) + bytes(mask_row * size)
 
 
-def build_ico(target: Path) -> Path:
-    chunks = [(size, _image_chunk(size, render(size))) for size in SIZES]
+def build_ico(target: Path, logo_path: Path | None = None) -> Path:
+    chunks = []
+    for size in SIZES:
+        rows = render_from_logo(logo_path, size) if logo_path is not None else None
+        if rows is None:
+            rows = render(size)
+        chunks.append((size, _image_chunk(size, rows)))
     header = struct.pack("<HHH", 0, 1, len(chunks))
     offset = 6 + 16 * len(chunks)
     entries = b""
@@ -75,5 +114,8 @@ def build_ico(target: Path) -> Path:
 
 if __name__ == "__main__":
     root = Path(__file__).resolve().parents[1]
-    path = build_ico(root / "resources" / "icon.ico")
-    print(f"icon written: {path} ({path.stat().st_size} bytes)")
+    logo = root / "resources" / "logo.png"
+    source = logo if logo.exists() else None
+    path = build_ico(root / "resources" / "icon.ico", source)
+    origin = "logo.png" if source else "procedural fallback"
+    print(f"icon written: {path} ({path.stat().st_size} bytes, from {origin})")

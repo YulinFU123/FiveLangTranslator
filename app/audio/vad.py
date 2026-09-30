@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-# Silero VAD @ 16 kHz 接受固定 512 样本窗口（32 ms）
+# Silero VAD @ 16 kHz 每帧固定 512 个新样本（32 ms）
 SILERO_WINDOW = 512
+# ...但模型实际要求「64 个上下文样本 + 512 新样本 = 576」。只喂 512 时，
+# 模型不会报错，却对所有输入恒输出 ≈ 0（人声、正弦、白噪声全试过），
+# 表现为「VAD 永远不触发、永远没有字幕」。
+SILERO_CONTEXT = 64
 SILERO_STATE_SHAPE = (2, 1, 128)
 
 
@@ -46,6 +50,7 @@ class SileroVADEngine:
         self.model_path = model_path
         self.session = None
         self._state = _default_state()
+        self._context = np.zeros(SILERO_CONTEXT, dtype=np.float32)
         self._sr = np.array(16000, dtype=np.int64)
 
     def initialize(self):
@@ -67,6 +72,7 @@ class SileroVADEngine:
 
     def reset(self):
         self._state = _default_state()
+        self._context = np.zeros(SILERO_CONTEXT, dtype=np.float32)
         return None
 
     def process(self, samples, level_db):
@@ -74,10 +80,14 @@ class SileroVADEngine:
             raise RuntimeError("Silero VAD 未初始化")
         if samples.size != SILERO_WINDOW:
             raise ValueError("Silero VAD requires 512 samples at 16 kHz")
-        window = np.ascontiguousarray(samples, dtype=np.float32).reshape(1, SILERO_WINDOW)
+        chunk = np.ascontiguousarray(samples, dtype=np.float32).reshape(-1)
+        # Prepend the 64-sample context the model expects, otherwise it returns
+        # ~0 for every input and the whole recognition chain stays silent.
+        window = np.concatenate([self._context, chunk]).reshape(1, -1)
         output, state = self.session.run(
             None, {"input": window, "state": self._state, "sr": self._sr}
         )
+        self._context = chunk[-SILERO_CONTEXT:].copy()
         self._state = np.asarray(state, dtype=np.float32).reshape(SILERO_STATE_SHAPE)
         return float(np.asarray(output, dtype=np.float32).reshape(-1)[0])
 

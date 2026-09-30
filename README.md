@@ -2,7 +2,18 @@
 
 本地离线实时双语悬浮字幕工具。v0.4.0-alpha.1 打通了「真实音频 → Silero VAD → whisper.cpp 五语识别 → Ollama/OpenAI 兼容翻译 → 悬浮双语字幕」全链路；本版本把这条链路上的结果可靠地保存下来，并补齐术语表编辑器与字幕导出。
 
-## 安装运行
+## 下载（推荐，免配环境）
+
+👉 **https://github.com/YulinFU123/FiveLangTranslator/releases/latest**
+
+下载 `FiveLangTranslator-<版本>-win64.zip`，解压后双击 `FiveLangTranslator.exe` 即可运行。
+
+**无需安装 Python、Qt 或任何运行环境**——便携包已内置 Python 3.12、PySide6 与全部依赖，解压即用。
+
+> 首次使用语音识别：在程序内点「下载模型」拉起 whisper 模型（一次性，之后离线可用）。
+> 本地翻译：需要本机 Ollama（已 pull 翻译模型）或任意 OpenAI 兼容服务（填自己的 API Key）。二者都不需要装插件，只需提供地址/密钥。
+
+## 安装运行（从源码）
 
 前置依赖：
 

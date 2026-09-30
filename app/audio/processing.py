@@ -97,6 +97,19 @@ class SpeechSegmenter:
         self.draft_interval_frames = frames(draft_interval_ms)
         self.reset()
 
+    def configure(self, min_silence_ms: float | None = None, max_seconds: float | None = None) -> None:
+        """Retune how quickly a sentence is treated as finished.
+
+        Shorter silence -> subtitles appear sooner, at the risk of cutting long
+        sentences. Longer silence -> more context for whisper, so more accuracy
+        but more waiting.
+        """
+        if min_silence_ms is not None:
+            self.min_silence = max(1, round(min_silence_ms / self.frame_ms))
+        if max_seconds is not None:
+            self.max_frames = max(1, int(max_seconds * self.rate / self.frame_size))
+        self.reset()
+
     def reset(self) -> None:
         self.pre = deque(maxlen=self.pre_count)
         self.candidate: list[AudioFrame] = []

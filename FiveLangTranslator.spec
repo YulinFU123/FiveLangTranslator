@@ -7,7 +7,15 @@ from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-hidden_imports = ["qasync", "numpy", "scipy"]
+hidden_imports = [
+    "qasync", "numpy", "scipy",
+    # Windows built-in OCR (WinRT projection) used by app.vision
+    "winsdk",
+    "winsdk.windows.media.ocr",
+    "winsdk.windows.globalization",
+    "winsdk.windows.graphics.imaging",
+    "winsdk.windows.storage.streams",
+]
 try:
     hidden_imports += collect_submodules("app")
 except Exception:  # pragma: no cover - defensive

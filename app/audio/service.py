@@ -5,6 +5,8 @@ import threading
 from dataclasses import asdict, dataclass
 from time import monotonic
 
+import numpy as np
+
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from app.audio.capture import PyAudioWASAPICapture
@@ -52,6 +54,11 @@ class AudioService(QObject):
         self.frames = FixedFrameBuffer()
         self.segmenter = SpeechSegmenter()
         self.vad = None
+        # Virtual cables (Voicemeeter / VB-Cable) often deliver audio near
+        # -50 dBFS, where Silero reports ~0% speech and nothing ever reaches
+        # whisper. This gain lifts the signal before VAD and segmentation.
+        self.gain_db = 0.0
+        self._gain_factor = 1.0
         self.packet_queue: queue.Queue = queue.Queue(maxsize=64)
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
@@ -81,6 +88,19 @@ class AudioService(QObject):
         except Exception:
             return []
 
+    def set_gain(self, gain_db: float) -> None:
+        """Lift quiet sources before VAD/segmentation.
+
+        Virtual cables often sit near -50 dBFS; boosting here raises the speech
+        probability Silero reports and what whisper finally receives.
+        """
+        self.gain_db = float(gain_db or 0.0)
+        self._gain_factor = 10.0 ** (self.gain_db / 20.0)
+
+    def set_segment_policy(self, min_silence_ms=None, max_seconds=None) -> None:
+        """Trade latency against accuracy when ending a sentence."""
+        self.segmenter.configure(min_silence_ms=min_silence_ms, max_seconds=max_seconds)
+
     def start_monitor(self) -> None:
         if self.available():
             self.monitor.start()
@@ -96,7 +116,12 @@ class AudioService(QObject):
         self.policy.kind = kind
         devices = self.list_devices()
         self.monitor.snapshot = self.monitor.snapshot.build(devices)
-        selected = next((d for d in devices if d.device_id == device_id), None) if device_id is not None else self.policy.select(self.monitor.snapshot)
+        selected = next((d for d in devices if d.device_id == device_id), None) if device_id is not None else None
+        if selected is None:
+            # The UI may hand us an index captured from an older enumeration
+            # (device unplugged / default switched). Fall back to the
+            # source-appropriate default instead of refusing to start.
+            selected = self.policy.select(self.monitor.snapshot)
         if not selected:
             self.status_changed.emit("没有找到可用音频设备")
             return
@@ -149,7 +174,8 @@ class AudioService(QObject):
             self.worker = threading.Thread(target=self._processing_loop, name="audio-processing", daemon=True)
             self.worker.start()
             try:
-                self.capture.start(device.device_id, self._packet, self._capture_error)
+                self.capture.start(device.device_id, self._packet, self._capture_error,
+                                   kind=device.source_kind)
                 self.active = device
                 self.running = True
                 self.health.active_device = device.name
@@ -206,6 +232,8 @@ class AudioService(QObject):
                 continue
             try:
                 samples = self.converter.convert(packet)
+                if self._gain_factor != 1.0 and samples.size:
+                    samples = np.clip(samples * self._gain_factor, -1.0, 1.0).astype(np.float32)
                 if self.next_frame_time is None:
                     self.next_frame_time = float(packet.timestamp_ms)
                 for data in self.frames.push(samples):

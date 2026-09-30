@@ -29,7 +29,7 @@ def test_deepseek_reuses_openai_compatible_driver():
     provider = TranslationProviderRegistry().create("deepseek")
     assert isinstance(provider, OpenAICompatibleTranslationProvider)
     assert provider.config.base_url == DEEPSEEK_BASE_URL
-    assert provider.config.model == "deepseek-chat"
+    assert provider.config.model == "deepseek-flash"
     assert provider.config.api_key_environment == "DEEPSEEK_API_KEY"
     assert provider.preset_id == "deepseek"
     assert provider.display_title == "DeepSeek"
@@ -62,7 +62,7 @@ def test_presets_fall_back_to_their_default_model():
     # An empty model field means "use the preset default".
     assert registry.validate("deepseek", DEEPSEEK_BASE_URL, "") == ""
     assert registry.validate("deepseek", DEEPSEEK_BASE_URL, "deepseek-chat") == ""
-    assert registry.create("deepseek", model="").config.model == "deepseek-chat"
+    assert registry.create("deepseek", model="").config.model == "deepseek-flash"
     # A blank address is always a configuration problem.
     assert "缺少服务地址" in registry.validate("ollama", "   ", "")
 
