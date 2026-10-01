@@ -18,6 +18,7 @@ class TranslationJob:
     glossary: dict[str, str] = field(default_factory=dict)
     style: str = "cinema"
     max_lines: int = DEFAULT_MAX_LINES
+    audio_end_ms: int = 0
 
 
 @dataclass(slots=True)

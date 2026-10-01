@@ -41,7 +41,19 @@ class TranslationService(QObject):
         self.max_lines = DEFAULT_MAX_LINES
         self.stats = LatencyTracker(50)
         self.draft_tasks: dict[str, asyncio.Task] = {}
-        self.final_tasks: set[asyncio.Task] = set()
+        self.final_tasks: list[asyncio.Task] = []
+        self.final_audio_end: dict[asyncio.Task, int] = {}
+        # Backpressure against translation backlog. When the provider cannot keep
+        # up with the rate of FINAL segments, pending translations pile up and the
+        # finished subtitle lags the audio by minutes. We keep at most
+        # ``max_pending_finals`` translations in flight (always the most recent)
+        # and cancel older pending ones. ``max_lag_ms`` is a secondary safety net:
+        # a translation whose source audio is this far behind the newest speech is
+        # discarded instead of being shown, keeping subtitles anchored to live audio.
+        self.max_pending_finals: int = 2
+        self.max_lag_ms: float = 20000.0
+        self.latest_audio_end_ms: int = 0
+        self.stale_dropped_count: int = 0
         # In-flight dedupe: maps a primary-provider cache key to the pending
         # translation future so concurrent identical requests share one call.
         self._inflight: dict[str, asyncio.Future] = {}
@@ -88,6 +100,10 @@ class TranslationService(QObject):
     def submit(self, recognition: RecognitionResult) -> None:
         if not self.enabled or not recognition.text.strip():
             return
+        # Track the newest audio timestamp so we can measure how far behind a
+        # finished translation is relative to live speech.
+        if recognition.end_ms:
+            self.latest_audio_end_ms = max(self.latest_audio_end_ms, recognition.end_ms)
         if recognition.language == self.target_language:
             result = TranslationResult(
                 recognition.segment_id, recognition.revision,
@@ -113,6 +129,7 @@ class TranslationService(QObject):
             dict(self.glossary),
             self.style,
             self.max_lines,
+            audio_end_ms=recognition.end_ms,
         )
         if recognition.status == SubtitleStatus.DRAFT:
             old = self.draft_tasks.get(recognition.segment_id)
@@ -125,8 +142,28 @@ class TranslationService(QObject):
             if old and not old.done():
                 old.cancel()
             task = asyncio.create_task(self._run(job, metadata, is_final=True))
-            self.final_tasks.add(task)
-            task.add_done_callback(self.final_tasks.discard)
+            self.final_tasks.append(task)
+            self.final_audio_end[task] = recognition.end_ms
+            task.add_done_callback(self._final_done)
+            # Cancel the oldest pending FINAL translations so the queue never
+            # grows into a multi-minute lag; only the most recent ones survive.
+            self._cap_pending_finals()
+
+    def _final_done(self, task: asyncio.Task) -> None:
+        self.final_tasks = [t for t in self.final_tasks if t is not task]
+        self.final_audio_end.pop(task, None)
+
+    def _cap_pending_finals(self) -> None:
+        """Keep the queue bounded by cancelling the oldest pending FINAL
+        translations. This is what stops a slow provider from accumulating a
+        minute-long backlog: only the most recent ``max_pending_finals`` survive,
+        so subtitles track live speech instead of ancient audio."""
+        self.final_tasks = [t for t in self.final_tasks if not t.done()]
+        while len(self.final_tasks) > self.max_pending_finals:
+            oldest = self.final_tasks.pop(0)
+            self.final_audio_end.pop(oldest, None)
+            if not oldest.done():
+                oldest.cancel()
 
     async def _run_draft(self, job, metadata) -> None:
         try:
@@ -230,6 +267,15 @@ class TranslationService(QObject):
 
         if job.revision < self.latest_revision.get(job.segment_id, 0):
             return
+        # Staleness guard: if this segment's audio ended far behind the newest
+        # speech we have seen, it is backlog from a slow provider. Showing it
+        # would put the subtitle minutes out of sync, so drop it. The newest
+        # segment always has a near-zero gap and is never dropped here.
+        audio_end = getattr(job, "audio_end_ms", 0)
+        if audio_end and self.latest_audio_end_ms and self.max_lag_ms > 0:
+            if (self.latest_audio_end_ms - audio_end) > self.max_lag_ms:
+                self.stale_dropped_count += 1
+                return
         result = TranslationResult(
             job.segment_id,
             job.revision,
@@ -258,6 +304,8 @@ class TranslationService(QObject):
             "fallback": fallback_used,
             "status": job.status.name.lower(),
             "total_elapsed_ms": int((monotonic() - started) * 1000),
+            "backlog": len(self.final_tasks),
+            "stale_dropped": self.stale_dropped_count,
         })
 
     def _lookup_cache(self, key: str) -> tuple[str | None, str | None]:
@@ -317,3 +365,4 @@ class TranslationService(QObject):
             task.cancel()
         self.draft_tasks.clear()
         self.final_tasks.clear()
+        self.final_audio_end.clear()
