@@ -51,9 +51,15 @@ class TranslationService(QObject):
         # a translation whose source audio is this far behind the newest speech is
         # discarded instead of being shown, keeping subtitles anchored to live audio.
         self.max_pending_finals: int = 2
+        self.max_queued_finals: int = 3
         self.max_lag_ms: float = 20000.0
         self.latest_audio_end_ms: int = 0
         self.stale_dropped_count: int = 0
+        self.queued_dropped_count: int = 0
+        # Pending (not yet started) FINAL translations. Unlike ``final_tasks``
+        # (which are in flight), items here have spent no provider time, so
+        # dropping the oldest of these never wastes in-progress work.
+        self.final_queue: list[tuple[TranslationJob, dict]] = []
         # In-flight dedupe: maps a primary-provider cache key to the pending
         # translation future so concurrent identical requests share one call.
         self._inflight: dict[str, asyncio.Future] = {}
@@ -141,29 +147,41 @@ class TranslationService(QObject):
             old = self.draft_tasks.pop(recognition.segment_id, None)
             if old and not old.done():
                 old.cancel()
-            task = asyncio.create_task(self._run(job, metadata, is_final=True))
-            self.final_tasks.append(task)
-            self.final_audio_end[task] = recognition.end_ms
-            task.add_done_callback(self._final_done)
-            # Cancel the oldest pending FINAL translations so the queue never
-            # grows into a multi-minute lag; only the most recent ones survive.
-            self._cap_pending_finals()
+            self._submit_final(job, metadata)
 
     def _final_done(self, task: asyncio.Task) -> None:
         self.final_tasks = [t for t in self.final_tasks if t is not task]
         self.final_audio_end.pop(task, None)
+        # A translation slot just freed up: start the newest queued speech so
+        # subtitles stay anchored to live audio instead of stalling.
+        if self.final_queue:
+            queued_job, queued_metadata = self.final_queue.pop()
+            self._start_final(queued_job, queued_metadata)
 
-    def _cap_pending_finals(self) -> None:
-        """Keep the queue bounded by cancelling the oldest pending FINAL
-        translations. This is what stops a slow provider from accumulating a
-        minute-long backlog: only the most recent ``max_pending_finals`` survive,
-        so subtitles track live speech instead of ancient audio."""
-        self.final_tasks = [t for t in self.final_tasks if not t.done()]
-        while len(self.final_tasks) > self.max_pending_finals:
-            oldest = self.final_tasks.pop(0)
-            self.final_audio_end.pop(oldest, None)
-            if not oldest.done():
-                oldest.cancel()
+    def _submit_final(self, job, metadata) -> None:
+        """Admit a FINAL translation, bounding both in-flight and queued work so a
+        slow provider cannot build a multi-minute lag.
+
+        Crucially we never cancel an *in-flight* translation: cancelling one that
+        is seconds into a provider call wastes completed work, and — when speech
+        is faster than translation — it cancels every in-flight job right before
+        it would finish, so no subtitle is ever produced (the v1.0.6 regression).
+        Instead we keep at most ``max_pending_finals`` jobs actually running and
+        park the rest in ``final_queue``; overflow drops the *oldest queued*
+        (least recent speech), which has spent no provider time yet."""
+        if len(self.final_tasks) < self.max_pending_finals:
+            self._start_final(job, metadata)
+            return
+        self.final_queue.append((job, metadata))
+        while len(self.final_queue) > self.max_queued_finals:
+            self.final_queue.pop(0)
+            self.queued_dropped_count += 1
+
+    def _start_final(self, job, metadata) -> None:
+        task = asyncio.create_task(self._run(job, metadata, is_final=True))
+        self.final_tasks.append(task)
+        self.final_audio_end[task] = job.audio_end_ms
+        task.add_done_callback(self._final_done)
 
     async def _run_draft(self, job, metadata) -> None:
         try:
@@ -304,8 +322,9 @@ class TranslationService(QObject):
             "fallback": fallback_used,
             "status": job.status.name.lower(),
             "total_elapsed_ms": int((monotonic() - started) * 1000),
-            "backlog": len(self.final_tasks),
+            "backlog": len(self.final_tasks) + len(self.final_queue),
             "stale_dropped": self.stale_dropped_count,
+            "queued_dropped": self.queued_dropped_count,
         })
 
     def _lookup_cache(self, key: str) -> tuple[str | None, str | None]:
@@ -366,3 +385,4 @@ class TranslationService(QObject):
         self.draft_tasks.clear()
         self.final_tasks.clear()
         self.final_audio_end.clear()
+        self.final_queue.clear()
